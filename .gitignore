@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Sweep result files (timestamped)
+optuna_parameter_sweep_results_*.json
+optuna_parameter_sweep_analyzed_*.csv
+
+# Local notes
+note-to-claude.txt

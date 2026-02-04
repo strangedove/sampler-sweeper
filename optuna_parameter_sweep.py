@@ -6,25 +6,73 @@ This script uses Optuna to optimize LLM sampling parameters by maximizing
 the text quality score calculated from analyze_results.py.
 
 Usage:
-    uv run optuna_parameter_sweep.py
+    uv run optuna_parameter_sweep.py --config sweep_config.yaml
+    uv run optuna_parameter_sweep.py   # uses defaults / env vars
 
 Dependencies:
-    optuna
-    openai
-    pandas
-    numpy
+    optuna, openai, pandas, numpy, pyyaml
     (same as analyze_results.py)
 """
 
+import argparse
+from collections import Counter
 import optuna
 import json
 import os
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
+import yaml
 import pandas as pd
 import numpy as np
 from openai import OpenAI
 from analyze_results import analyze_text_quality
+
+
+# ------------------------------------------------------------------
+# Default parameter space (used when no config file is provided)
+# ------------------------------------------------------------------
+DEFAULT_PARAMETERS = {
+    'temperature': [0.1, 2.0],
+    'min_p': [0.0, 0.3],
+    'top_k': [0, 100],
+    'adaptive_target': [0.3, 0.7],
+    'adaptive_decay': [0.5, 0.9],
+}
+
+# Parameters the OpenAI client accepts natively (not via extra_body)
+NATIVE_OPENAI_PARAMS = {'temperature', 'top_p', 'max_tokens', 'frequency_penalty', 'presence_penalty'}
+
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Load sweep configuration from a YAML file."""
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    return cfg or {}
+
+
+def parse_parameter_space(params_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Parse parameter definitions from config into a structured list.
+
+    Each entry in params_dict maps a name to a range:
+        temperature: [0.1, 2.0]         -> float
+        top_k: [0, 100]                 -> int  (both bounds are int)
+        top_k: [0, 100, "int"]          -> int  (explicit)
+        min_p: [0.0, 0.3, "float"]      -> float (explicit)
+    """
+    parsed = []
+    for name, spec in params_dict.items():
+        if not isinstance(spec, list) or len(spec) < 2:
+            raise ValueError(f"Parameter '{name}' must be a list of [min, max] or [min, max, type]")
+        lo, hi = spec[0], spec[1]
+        # Determine type
+        if len(spec) >= 3 and isinstance(spec[2], str):
+            ptype = spec[2].lower()
+        elif isinstance(lo, int) and isinstance(hi, int):
+            ptype = 'int'
+        else:
+            ptype = 'float'
+        parsed.append({'name': name, 'low': lo, 'high': hi, 'type': ptype})
+    return parsed
 
 
 class OptunaParameterSweep:
@@ -34,6 +82,7 @@ class OptunaParameterSweep:
                  base_url: str,
                  model_name: str,
                  prompt: str,
+                 parameter_space: Optional[List[Dict[str, Any]]] = None,
                  max_tokens: int = 1024,
                  max_trials: int = 100,
                  timeout: Optional[int] = None,
@@ -41,21 +90,6 @@ class OptunaParameterSweep:
                  study_name: str = "llm_parameter_optimization",
                  storage: Optional[str] = None,
                  api_key: str = "not-needed"):
-        """
-        Initialize the parameter sweep.
-
-        Args:
-            base_url: Base URL for the OpenAI-compatible API
-            model_name: Name/ID of the model to use
-            prompt: Input prompt for the LLM (completion-style)
-            max_tokens: Maximum tokens to generate per trial
-            max_trials: Maximum number of optimization trials
-            timeout: Timeout in seconds for the study
-            n_jobs: Number of parallel jobs (1 for sequential)
-            study_name: Name for the Optuna study
-            storage: Optional storage URL for distributed optimization
-            api_key: API key (use "not-needed" for local servers)
-        """
         self.base_url = base_url
         self.model_name = model_name
         self.prompt = prompt
@@ -65,6 +99,7 @@ class OptunaParameterSweep:
         self.n_jobs = n_jobs
         self.study_name = study_name
         self.storage = storage
+        self.parameter_space = parameter_space or parse_parameter_space(DEFAULT_PARAMETERS)
 
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -73,14 +108,12 @@ class OptunaParameterSweep:
     # ------------------------------------------------------------------
     def objective(self, trial: optuna.Trial) -> float:
         """Objective function for Optuna optimization."""
-        params = {
-            'temperature': trial.suggest_float('temperature', 0.1, 2.0),
-            'min_p': trial.suggest_float('min_p', 0.0, 0.3),
-            'top_p': trial.suggest_float('top_p', 0.5, 1.0),
-            'top_k': trial.suggest_int('top_k', 0, 100),
-            'rep_pen': trial.suggest_float('rep_pen', 1.0, 1.3),
-            'typical': trial.suggest_float('typical', 0.5, 1.0),
-        }
+        params = {}
+        for p in self.parameter_space:
+            if p['type'] == 'int':
+                params[p['name']] = trial.suggest_int(p['name'], int(p['low']), int(p['high']))
+            else:
+                params[p['name']] = trial.suggest_float(p['name'], float(p['low']), float(p['high']))
 
         try:
             response_text = self._generate_llm_response(params)
@@ -102,6 +135,10 @@ class OptunaParameterSweep:
         trial.set_user_attr('readability_score', quality_metrics['readability_score'])
         trial.set_user_attr('lazy_score', quality_metrics.get('lazy_score', 0.0))
         trial.set_user_attr('lazy_pattern_count', quality_metrics.get('lazy_pattern_count', 0))
+        # Store the specific patterns that matched (list of [pattern, count])
+        patterns_found = quality_metrics.get('lazy_patterns_found', [])
+        trial.set_user_attr('lazy_patterns_found',
+                            [[p, c] for p, c in patterns_found])
 
         if score < 0.1:
             raise optuna.exceptions.TrialPruned(f"Low quality score: {score}")
@@ -113,20 +150,19 @@ class OptunaParameterSweep:
     # ------------------------------------------------------------------
     def _generate_llm_response(self, params: Dict[str, Any]) -> str:
         """Generate a completion from the LLM using the given sampling params."""
-        # KoboldCpp accepts extra sampler params via extra_body
-        response = self.client.completions.create(
+        native = {k: v for k, v in params.items() if k in NATIVE_OPENAI_PARAMS}
+        extra = {k: v for k, v in params.items() if k not in NATIVE_OPENAI_PARAMS}
+
+        kwargs: Dict[str, Any] = dict(
             model=self.model_name,
             prompt=self.prompt,
             max_tokens=self.max_tokens,
-            temperature=params['temperature'],
-            top_p=params['top_p'],
-            extra_body={
-                'min_p': params['min_p'],
-                'top_k': params['top_k'],
-                'rep_pen': params['rep_pen'],
-                'typical': params['typical'],
-            },
+            **native,
         )
+        if extra:
+            kwargs['extra_body'] = extra
+
+        response = self.client.completions.create(**kwargs)
         return response.choices[0].text
 
     # ------------------------------------------------------------------
@@ -224,12 +260,15 @@ class OptunaParameterSweep:
         df = pd.DataFrame(data)
 
         if len(df) > 0:
-            df['overall_score'] = (
-                df['value'] * 0.4 +
-                (1 - df['repetition_penalty']) * 0.3 +
-                df['coherence_score'] * 0.2 +
-                df['readability_score'] * 0.1
+            # Mirror the formula from analyze_results.analyze_text_quality:
+            # base = coherence*0.3 + readability*0.3 + (1-lazy)*0.4
+            # overall = base * (1 - repetition_penalty)
+            base = (
+                df['coherence_score'] * 0.30 +
+                df['readability_score'] * 0.30 +
+                (1 - df['lazy_score']) * 0.40
             )
+            df['overall_score'] = base * (1 - df['repetition_penalty'])
 
         return df
 
@@ -239,7 +278,7 @@ class OptunaParameterSweep:
             return {'total_trials': 0, 'completed_trials': 0}
 
         best_idx = df['overall_score'].idxmax()
-        param_cols = ['temperature', 'min_p', 'top_p', 'top_k', 'rep_pen', 'typical']
+        param_cols = [p['name'] for p in self.parameter_space]
         best_params = {c: df.loc[best_idx, c] for c in param_cols if c in df.columns}
 
         return {
@@ -292,48 +331,120 @@ class OptunaParameterSweep:
         print()
         print("=" * 60)
 
+    def print_pattern_summary(self, study: optuna.Study) -> None:
+        """Print aggregate slop pattern frequencies across all completed trials."""
+        # Aggregate across ALL completed trials
+        all_counts: Counter = Counter()
+        all_trials_with: Counter = Counter()   # how many trials had this pattern
+        n_completed = 0
 
-def main():
-    """Main function to run the parameter sweep"""
+        for trial in study.trials:
+            if trial.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            n_completed += 1
+            patterns = trial.user_attrs.get('lazy_patterns_found', [])
+            seen_this_trial: set = set()
+            for pat, count in patterns:
+                all_counts[pat] += count
+                if pat not in seen_this_trial:
+                    all_trials_with[pat] += 1
+                    seen_this_trial.add(pat)
 
-    # Configuration
-    BASE_URL = os.environ.get(
-        "LLM_BASE_URL",
-        "https://poly-wife-replacement-removal.trycloudflare.com/v1",
-    )
-    MODEL_NAME = os.environ.get("LLM_MODEL", "")  # empty = use whatever the server has
-    MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "512"))
-    MAX_TRIALS = int(os.environ.get("SWEEP_MAX_TRIALS", "30"))
+        if not all_counts:
+            return
 
-    PROMPT = """Continue the following story in vivid, creative prose:
+        print()
+        print("=" * 60)
+        print("SLOP PATTERN FREQUENCY (all completed trials)")
+        print("=" * 60)
+        print(f"  {'Pattern':<45} {'Hits':>5}  {'Trials':>6}  {'%Trials':>7}")
+        print(f"  {'-'*45} {'-'*5}  {'-'*6}  {'-'*7}")
+        for pat, total_hits in all_counts.most_common(30):
+            n_trials = all_trials_with[pat]
+            pct = 100.0 * n_trials / n_completed if n_completed else 0
+            # Truncate long regex patterns for display
+            display = pat[:45] if len(pat) <= 45 else pat[:42] + "..."
+            print(f"  {display:<45} {total_hits:>5}  {n_trials:>6}  {pct:>6.1f}%")
+        print("=" * 60)
 
-Once upon a time in a small village nestled between rolling hills, there lived a young girl named Elara.
-She was known throughout the village for her curiosity and her unusual ability to understand the language of animals.
-One day, while exploring the forest edge, she heard a faint whimpering sound coming from a dense thicket.
+
+DEFAULT_PROMPT = """Continue the following story in vivid, creative prose:
+
+The morning Dagna found the dead radio tower, she was already three days late getting back to town.
+She sat on a lichen-covered boulder and ate the last of her dried fish while studying the structure.
+The cables had been cut -- not frayed, not corroded, but sliced clean through with something sharp.
 """
 
-    # Auto-detect model name if not set
-    if not MODEL_NAME:
+
+def main():
+    """Main function to run the parameter sweep."""
+    parser = argparse.ArgumentParser(description="Optuna LLM parameter sweep")
+    parser.add_argument("--config", "-c", type=str, default=None,
+                        help="Path to YAML config file")
+    args = parser.parse_args()
+
+    # --- Defaults (overridden by env vars, then by config file) ----------
+    base_url = os.environ.get("LLM_BASE_URL",
+                              "https://poly-wife-replacement-removal.trycloudflare.com/v1")
+    model_name = os.environ.get("LLM_MODEL", "")
+    api_key = os.environ.get("LLM_API_KEY", "not-needed")
+    max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "512"))
+    max_trials = int(os.environ.get("SWEEP_MAX_TRIALS", "30"))
+    n_jobs = 1
+    study_name = "llm_parameter_optimization"
+    prompt = DEFAULT_PROMPT
+    params_dict = dict(DEFAULT_PARAMETERS)
+
+    # --- Load config file if provided ------------------------------------
+    if args.config:
+        cfg = load_config(args.config)
+        api_cfg = cfg.get('api', {})
+        base_url = api_cfg.get('base_url', base_url)
+        model_name = api_cfg.get('model', model_name)
+        api_key = api_cfg.get('api_key', api_key)
+        max_tokens = api_cfg.get('max_tokens', max_tokens)
+
+        sweep_cfg = cfg.get('sweep', {})
+        max_trials = sweep_cfg.get('max_trials', max_trials)
+        n_jobs = sweep_cfg.get('n_jobs', n_jobs)
+        study_name = sweep_cfg.get('study_name', study_name)
+
+        if 'prompt' in cfg:
+            prompt = cfg['prompt']
+
+        if 'parameters' in cfg:
+            params_dict = cfg['parameters']
+
+        print(f"Loaded config from: {args.config}")
+
+    parameter_space = parse_parameter_space(params_dict)
+
+    # --- Auto-detect model name if empty ---------------------------------
+    if not model_name:
         try:
-            client = OpenAI(base_url=BASE_URL, api_key="not-needed")
+            client = OpenAI(base_url=base_url, api_key=api_key)
             models = client.models.list()
-            MODEL_NAME = models.data[0].id
-            print(f"Auto-detected model: {MODEL_NAME}")
+            model_name = models.data[0].id
+            print(f"Auto-detected model: {model_name}")
         except Exception as e:
             print(f"Could not auto-detect model: {e}")
-            MODEL_NAME = "default"
+            model_name = "default"
 
     print("OPTUNA PARAMETER SWEEP FOR LLM OPTIMIZATION")
     print("=" * 60)
+    print(f"Parameters: {', '.join(p['name'] for p in parameter_space)}")
     print()
 
     sweep = OptunaParameterSweep(
-        base_url=BASE_URL,
-        model_name=MODEL_NAME,
-        prompt=PROMPT,
-        max_tokens=MAX_TOKENS,
-        max_trials=MAX_TRIALS,
-        n_jobs=1,
+        base_url=base_url,
+        model_name=model_name,
+        prompt=prompt,
+        parameter_space=parameter_space,
+        max_tokens=max_tokens,
+        max_trials=max_trials,
+        n_jobs=n_jobs,
+        study_name=study_name,
+        api_key=api_key,
     )
 
     study = sweep.run_study()
@@ -344,6 +455,7 @@ One day, while exploring the forest edge, she heard a faint whimpering sound com
     if len(df) > 0:
         summary = sweep.generate_summary(df)
         sweep.print_summary(summary)
+        sweep.print_pattern_summary(study)
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         analyzed_filename = f"optuna_parameter_sweep_analyzed_{timestamp}.csv"

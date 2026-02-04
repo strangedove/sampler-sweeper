@@ -1259,6 +1259,7 @@ dependencies = [
     { name = "openai" },
     { name = "optuna" },
     { name = "pandas" },
+    { name = "pyyaml" },
     { name = "seaborn" },
 ]
 
@@ -1270,6 +1271,7 @@ requires-dist = [
     { name = "openai", specifier = ">=2.16.0" },
     { name = "optuna" },
     { name = "pandas" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "seaborn", specifier = ">=0.13.2" },
 ]
 

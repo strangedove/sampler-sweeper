@@ -11,5 +11,6 @@ dependencies = [
     "openai>=2.16.0",
     "optuna",
     "pandas",
+    "pyyaml>=6.0.3",
     "seaborn>=0.13.2",
 ]

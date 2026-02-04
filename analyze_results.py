@@ -136,22 +136,73 @@ def calculate_repetition_metrics(text: str) -> Dict[str, float]:
     for i in range(len(tokens) - 1):
         if tokens[i] == tokens[i + 1]:
             consecutive_repeats += 1
-    
+
     consecutive_repetition_score = consecutive_repeats / max(1, len(tokens) - 1)
-    
+
+    # ------------------------------------------------------------------
+    # Sentence-level duplicate detection
+    # ------------------------------------------------------------------
+    # Split into sentences and normalise whitespace for comparison
+    if HAS_NLTK:
+        sentences = sent_tokenize(text)
+    else:
+        sentences = re.split(r'[.!?]+', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+    num_sentences = len(sentences)
+    if num_sentences >= 2:
+        normalised = [re.sub(r'\s+', ' ', s.strip().lower()) for s in sentences]
+        unique_sentences = len(set(normalised))
+        # Ratio of duplicated sentences (0 = all unique, 1 = all copies)
+        sentence_duplicate_ratio = 1.0 - unique_sentences / num_sentences
+    else:
+        sentence_duplicate_ratio = 0.0
+
+    # ------------------------------------------------------------------
+    # Long-span (sequence) repetition detection
+    # ------------------------------------------------------------------
+    # Slide a window of W words across the text and check how many windows
+    # are near-duplicates of an earlier window. This catches the "stuck in
+    # a loop" failure mode where multi-sentence blocks repeat verbatim.
+    W = 30  # window size in tokens (roughly one sentence)
+    if len(tokens) >= W * 2:
+        seen: set = set()
+        dupes = 0
+        total_windows = len(tokens) - W + 1
+        for i in range(total_windows):
+            window = ' '.join(tokens[i:i + W])
+            if window in seen:
+                dupes += 1
+            else:
+                seen.add(window)
+        sequence_repetition_score = dupes / total_windows
+    else:
+        sequence_repetition_score = 0.0
+
+    # ------------------------------------------------------------------
     # Overall repetition penalty (composite score)
-    repetition_penalty = (
+    # ------------------------------------------------------------------
+    # The n-gram metrics catch small-scale word reuse.
+    # sentence_duplicate_ratio catches whole-sentence copy-paste.
+    # sequence_repetition_score catches multi-sentence looping.
+    # We take the MAX of the sentence/sequence scores with the n-gram
+    # composite so that any single severe failure mode dominates.
+    ngram_penalty = (
         token_repetition_rate * 0.4 +
         bigram_repetition_rate * 0.3 +
         trigram_repetition_rate * 0.2 +
         consecutive_repetition_score * 0.1
     )
-    
+    block_penalty = max(sentence_duplicate_ratio, sequence_repetition_score)
+    repetition_penalty = max(ngram_penalty, block_penalty)
+
     return {
         'token_repetition_rate': token_repetition_rate,
         'bigram_repetition_rate': bigram_repetition_rate,
         'trigram_repetition_rate': trigram_repetition_rate,
         'consecutive_repetition_score': consecutive_repetition_score,
+        'sentence_duplicate_ratio': sentence_duplicate_ratio,
+        'sequence_repetition_score': sequence_repetition_score,
         'repetition_penalty': repetition_penalty
     }
 
@@ -426,6 +477,87 @@ DEFAULT_LITERAL_STRINGS: List[str] = [
     "lorem ipsum",
     "the quick brown fox",
     "placeholder",
+
+    # --- AI slop vocabulary (overused "fancy" words) ---
+    "Eldoria",
+    "Lumina",
+    "ethereal",
+    "celestial",
+    "resplendent",
+    "kaleidoscopic",
+    "gloaming",
+    "gossamer",       # also in purple prose above, but deduped at search time
+    "tapestry",
+    "symphony",
+    "gilded",
+    "azure",
+    "obsidian",       # dupe — harmless, counted once per occurrence
+    "crimson",        # dupe
+    "sapphire",
+    "ruby",
+    "emerald",
+    "sentinel",
+    "conflagration of",
+    "velvet",
+    "moonlit",
+    "moonless",
+    "twilight",
+    "sultry",
+    "melancholic",
+    "stark contrast",
+    "inky",
+    "bustling",
+    "abyss",
+    "gnarled",
+    "profound",
+    "beloved",
+    "cosmos",
+    "devoid",
+    "trepidation",
+    "sun-kissed",
+    "boundless",
+    "lullaby",
+    "labyrinth",
+    "unyielding",
+    "ensnared",
+    "fiery",
+    "raven",
+    "twin pools",
+    "beacon",
+    "testament",
+    "embodiment",
+    "flicker",
+    "specter",
+    "cinematic",
+    "etched with",
+    "the very air",
+    "veil of",
+    "bathed in",
+    "painting the",
+    "gleaming with",
+    "faintest hint",
+    "a pang of",       # dupe
+    "thick with",
+    "the air was",
+    "rise and fall",
+    "slither",
+    "caress",
+    "adrift",
+    "abuzz",
+    "perpetually",
+    "hue",
+    "purr",
+    "entangled",
+    "scarcely believe",
+    "defied the very",
+    "the very notion",
+    "the halls of",
+    "shattered like",
+    "yearned for",
+    "realm",
+    "neon lights",
+    "a thousand ships",
+    "Elara",          # AI's favourite character name
 ]
 
 # REGEX_PATTERNS are compiled with re.IGNORECASE. Each pattern is searched
@@ -580,15 +712,21 @@ def analyze_text_quality(
         patterns=lazy_patterns,
     )
     
-    # Calculate overall quality score (weighted average)
-    # Penalize lazy text heavily since it indicates poor creativity
+    # Calculate overall quality score
+    # The repetition_penalty already uses max(ngram, block) so severe
+    # looping drives it toward 1.0.  We multiply the base score by
+    # (1 - rep_penalty) so that highly repetitive text is crushed
+    # regardless of how well the other metrics look.
     lazy_penalty = lazy_metrics['lazy_score']
-    overall_quality = (
-        (1.0 - repetition_metrics['repetition_penalty']) * 0.3 +
-        coherence_metrics['coherence_score'] * 0.2 +
-        readability_metrics['readability_score'] * 0.2 +
-        (1.0 - lazy_penalty) * 0.3  # Heavy weighting against lazy text
+    rep_penalty = repetition_metrics['repetition_penalty']
+
+    base_quality = (
+        coherence_metrics['coherence_score'] * 0.30 +
+        readability_metrics['readability_score'] * 0.30 +
+        (1.0 - lazy_penalty) * 0.40
     )
+    # Multiplicative penalty: rep_penalty=0 → no effect, rep_penalty=1 → score→0
+    overall_quality = base_quality * (1.0 - rep_penalty)
     
     # Combine all metrics
     all_metrics = {
