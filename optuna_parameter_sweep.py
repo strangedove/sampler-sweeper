@@ -10,6 +10,7 @@ Usage:
 
 Dependencies:
     optuna
+    openai
     pandas
     numpy
     (same as analyze_results.py)
@@ -22,93 +23,78 @@ import time
 from typing import Dict, Any, Optional
 import pandas as pd
 import numpy as np
+from openai import OpenAI
 from analyze_results import analyze_text_quality
-import re
 
 
 class OptunaParameterSweep:
     """Optuna-based parameter sweep for LLM sampling optimization"""
-    
-    def __init__(self, 
+
+    def __init__(self,
+                 base_url: str,
                  model_name: str,
                  prompt: str,
+                 max_tokens: int = 1024,
                  max_trials: int = 100,
                  timeout: Optional[int] = None,
                  n_jobs: int = 1,
                  study_name: str = "llm_parameter_optimization",
-                 storage: Optional[str] = None):
+                 storage: Optional[str] = None,
+                 api_key: str = "not-needed"):
         """
         Initialize the parameter sweep.
-        
+
         Args:
-            model_name: Name of the LLM model to use
-            prompt: Input prompt for the LLM
+            base_url: Base URL for the OpenAI-compatible API
+            model_name: Name/ID of the model to use
+            prompt: Input prompt for the LLM (completion-style)
+            max_tokens: Maximum tokens to generate per trial
             max_trials: Maximum number of optimization trials
             timeout: Timeout in seconds for the study
             n_jobs: Number of parallel jobs (1 for sequential)
             study_name: Name for the Optuna study
             storage: Optional storage URL for distributed optimization
+            api_key: API key (use "not-needed" for local servers)
         """
+        self.base_url = base_url
         self.model_name = model_name
         self.prompt = prompt
+        self.max_tokens = max_tokens
         self.max_trials = max_trials
         self.timeout = timeout
         self.n_jobs = n_jobs
         self.study_name = study_name
         self.storage = storage
-        
-        # Initialize LLM client (placeholder - replace with actual client)
-        self.client = self._initialize_llm_client()
-        
-    def _initialize_llm_client(self):
-        """
-        Initialize the LLM client.
-        
-        Returns:
-            LLM client object (placeholder - replace with actual implementation)
-        """
-        # This is a placeholder - replace with actual LLM client initialization
-        # For example:
-        # from some_llm_library import Client
-        # return Client(api_key="your-api-key")
-        
-        class MockLLMClient:
-            """Mock LLM client for demonstration"""
-            def completions_create(self, **kwargs):
-                """Mock completion method"""
-                # In a real implementation, this would call the actual LLM API
-                # For now, we'll return a mock response
-                return MockCompletionResponse()
-        
-        return MockLLMClient()
-    
+
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
+
+    # ------------------------------------------------------------------
+    # Optuna objective
+    # ------------------------------------------------------------------
     def objective(self, trial: optuna.Trial) -> float:
-        """
-        Objective function for Optuna optimization.
-        
-        Args:
-            trial: Optuna trial object
-            
-        Returns:
-            Quality score (higher is better)
-        """
-        # Define hyper-parameters to optimize
+        """Objective function for Optuna optimization."""
         params = {
-            'temperature': trial.suggest_float('temperature', 0.1, 1.5),
-            'min_p': trial.suggest_float('min_p', 0.0, 0.9),
-            'adaptive_target': trial.suggest_float('adaptive_target', 0.5, 1.5),
-            'adaptive_decay': trial.suggest_float('adaptive_decay', 0.8, 0.99),
-            'top_nsigma': trial.suggest_float('top_nsigma', 1.0, 3.0),
+            'temperature': trial.suggest_float('temperature', 0.1, 2.0),
+            'min_p': trial.suggest_float('min_p', 0.0, 0.3),
+            'top_p': trial.suggest_float('top_p', 0.5, 1.0),
+            'top_k': trial.suggest_int('top_k', 0, 100),
+            'rep_pen': trial.suggest_float('rep_pen', 1.0, 1.3),
+            'typical': trial.suggest_float('typical', 0.5, 1.0),
         }
-        
-        # Generate response from LLM
-        response_text = self._generate_llm_response(params)
-        
-        # Calculate quality score
+
+        try:
+            response_text = self._generate_llm_response(params)
+        except Exception as e:
+            print(f"  [trial {trial.number}] API error: {e}")
+            raise optuna.exceptions.TrialPruned(f"API error: {e}")
+
+        if not response_text or len(response_text.strip()) < 20:
+            raise optuna.exceptions.TrialPruned("Empty or very short response")
+
         quality_metrics = analyze_text_quality(response_text)
         score = quality_metrics['quality_score']
-        
-        # Store additional metrics for analysis
+
+        # Store metrics for analysis
         trial.set_user_attr('response_text', response_text)
         trial.set_user_attr('response_length', len(response_text))
         trial.set_user_attr('repetition_penalty', quality_metrics['repetition_penalty'])
@@ -116,173 +102,85 @@ class OptunaParameterSweep:
         trial.set_user_attr('readability_score', quality_metrics['readability_score'])
         trial.set_user_attr('lazy_score', quality_metrics.get('lazy_score', 0.0))
         trial.set_user_attr('lazy_pattern_count', quality_metrics.get('lazy_pattern_count', 0))
-        
-        # Prune trials with very low quality
+
         if score < 0.1:
             raise optuna.exceptions.TrialPruned(f"Low quality score: {score}")
-        
+
         return score
-    
-    def _generate_llm_response(self, params: Dict[str, float]) -> str:
-        """
-        Generate a response from the LLM using given parameters.
-        
-        Args:
-            params: Dictionary of sampling parameters
-            
-        Returns:
-            Generated text response
-        """
-        # This is a placeholder - replace with actual LLM API call
-        # Example for a real implementation:
-        # stream = self.client.completions.create(
-        #     model=self.model_name,
-        #     prompt=self.prompt,
-        #     temperature=params['temperature'],
-        #     min_p=params['min_p'],
-        #     max_tokens=3000,
-        #     stop="</response>",
-        #     stream=True,
-        #     extra_query={
-        #         "adaptive_target": params['adaptive_target'],
-        #         "adaptive_decay": params['adaptive_decay'],
-        #         "top_nsigma": params['top_nsigma'],
-        #     },
-        # )
-        # 
-        # completion = ""
-        # for chunk in stream:
-        #     completion += chunk.choices[0].text
-        # 
-        # return completion
-        
-        # Mock response for demonstration
-        return self._generate_mock_response(params)
-    
-    def _generate_mock_response(self, params: Dict[str, float]) -> str:
-        """
-        Generate a mock response for demonstration purposes.
-        
-        Args:
-            params: Sampling parameters
-            
-        Returns:
-            Mock response text
-        """
-        # Generate mock text based on parameters
-        temperature = params['temperature']
-        min_p = params['min_p']
-        
-        # Simulate different response styles based on parameters
-        if temperature < 0.5:
-            # Low temperature - deterministic, focused
-            response = f"""The story continues with a clear, focused narrative. "
-            f"The characters make logical decisions based on their motivations. "
-            f"The plot progresses in a straightforward manner with minimal digressions. "
-            f"Word choice is precise and vocabulary is varied. "
-            f"Sentence structure is consistent and coherent."""
-        elif temperature < 1.0:
-            # Medium temperature - balanced
-            response = f"""The narrative unfolds with a good balance of creativity and structure. "
-            f"Characters exhibit both logical and somewhat unpredictable behavior. "
-            f"The plot develops with interesting twists while maintaining coherence. "
-            f"Language use shows moderate diversity with occasional repetition. "
-            f"Sentences vary in length, creating a natural rhythm."""
-        else:
-            # High temperature - creative, diverse
-            response = f"""The story takes unexpected turns with creative flair. "
-            f"Characters behave in surprising ways, driven by emotional impulses. "
-            f"The plot explores multiple themes and subplots simultaneously. "
-            f"Vocabulary is diverse but may include some repetitive phrases. "
-            f"Sentence structure varies widely, from short fragments to complex constructions."""
-        
-        # Add some variation based on min_p
-        if min_p < 0.3:
-            response += f" "
-            f"The text demonstrates excellent control over repetition, with minimal "
-            f"repetitive patterns or overused phrases."
-        elif min_p < 0.6:
-            response += f" "
-            f"There is some repetition in the text, but it doesn't significantly "
-            f"detract from the overall quality."
-        else:
-            response += f" "
-            f"The text contains noticeable repetition, which may affect readability."
-        
-        return response
-    
+
+    # ------------------------------------------------------------------
+    # LLM generation
+    # ------------------------------------------------------------------
+    def _generate_llm_response(self, params: Dict[str, Any]) -> str:
+        """Generate a completion from the LLM using the given sampling params."""
+        # KoboldCpp accepts extra sampler params via extra_body
+        response = self.client.completions.create(
+            model=self.model_name,
+            prompt=self.prompt,
+            max_tokens=self.max_tokens,
+            temperature=params['temperature'],
+            top_p=params['top_p'],
+            extra_body={
+                'min_p': params['min_p'],
+                'top_k': params['top_k'],
+                'rep_pen': params['rep_pen'],
+                'typical': params['typical'],
+            },
+        )
+        return response.choices[0].text
+
+    # ------------------------------------------------------------------
+    # Study runner
+    # ------------------------------------------------------------------
     def run_study(self) -> optuna.Study:
-        """
-        Run the Optuna optimization study.
-        
-        Returns:
-            Completed Optuna study object
-        """
-        print(f"🚀 Starting Optuna parameter sweep")
+        """Run the Optuna optimization study."""
+        print(f"Starting Optuna parameter sweep")
+        print(f"   API: {self.base_url}")
         print(f"   Model: {self.model_name}")
         print(f"   Max trials: {self.max_trials}")
         print(f"   Parallel jobs: {self.n_jobs}")
         print(f"   Study name: {self.study_name}")
         print()
-        
-        # Create sampler with pruning
+
         sampler = optuna.samplers.TPESampler(n_startup_trials=20)
-        
-        # Create pruner
         pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
-        
-        # Create study
+
         study = optuna.create_study(
             study_name=self.study_name,
             sampler=sampler,
             pruner=pruner,
             direction='maximize',
             storage=self.storage,
-            load_if_exists=True
+            load_if_exists=True,
         )
-        
-        # Run optimization
+
         study.optimize(
             self.objective,
             n_trials=self.max_trials,
             timeout=self.timeout,
             n_jobs=self.n_jobs,
-            callbacks=[self._progress_callback]
+            callbacks=[self._progress_callback],
         )
-        
+
         return study
-    
+
     def _progress_callback(self, study: optuna.Study, trial: optuna.Trial) -> None:
-        """
-        Callback function to display progress during optimization.
-        
-        Args:
-            study: Optuna study object
-            trial: Current trial object
-        """
-        if trial.number % 10 == 0 or trial.number == 0:
-            print(f"📊 Trial {trial.number + 1}/{self.max_trials}")
-            print(f"   Best value: {study.best_value:.4f}")
-            print(f"   Best params: {study.best_params}")
-            print(f"   Pruned trials: {len(study.get_trials(deepcopy=False, states=[optuna.trial.TrialState.PRUNED]))}")
-            print()
-    
+        """Print progress every 5 trials."""
+        if trial.number % 5 == 0 or trial.number == 0:
+            pruned = len(study.get_trials(deepcopy=False, states=[optuna.trial.TrialState.PRUNED]))
+            print(f"[{trial.number + 1}/{self.max_trials}]  "
+                  f"best={study.best_value:.4f}  pruned={pruned}  "
+                  f"params={study.best_params}")
+
+    # ------------------------------------------------------------------
+    # Results
+    # ------------------------------------------------------------------
     def save_results(self, study: optuna.Study, filename: Optional[str] = None) -> str:
-        """
-        Save optimization results to JSON file.
-        
-        Args:
-            study: Completed Optuna study
-            filename: Optional filename (auto-generated if None)
-            
-        Returns:
-            Path to saved results file
-        """
+        """Save optimization results to JSON file."""
         if filename is None:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             filename = f"optuna_parameter_sweep_results_{timestamp}.json"
-        
-        # Convert study results to list of dictionaries
+
         results = []
         for trial in study.trials:
             result = {
@@ -290,41 +188,29 @@ class OptunaParameterSweep:
                 'state': trial.state.name,
                 'value': trial.value,
                 'parameters': trial.params,
-                'user_attrs': trial.user_attrs,
+                'user_attrs': {k: v for k, v in trial.user_attrs.items()
+                               if k != 'response_text'},
+                'response_text': trial.user_attrs.get('response_text', ''),
                 'datetime_start': trial.datetime_start.isoformat() if trial.datetime_start else None,
                 'datetime_complete': trial.datetime_complete.isoformat() if trial.datetime_complete else None,
             }
             results.append(result)
-        
-        # Save to JSON
+
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
-        
-        print(f"💾 Results saved to: {filename}")
+
+        print(f"Results saved to: {filename}")
         return filename
-    
+
     def analyze_results(self, study: optuna.Study) -> pd.DataFrame:
-        """
-        Analyze optimization results and generate summary statistics.
-        
-        Args:
-            study: Completed Optuna study
-            
-        Returns:
-            DataFrame with analyzed results
-        """
-        # Convert to DataFrame
+        """Convert completed trials into a DataFrame for analysis."""
         data = []
         for trial in study.trials:
             if trial.state == optuna.trial.TrialState.COMPLETE:
                 row = {
                     'trial': trial.number,
                     'value': trial.value,
-                    'temperature': trial.params.get('temperature'),
-                    'min_p': trial.params.get('min_p'),
-                    'adaptive_target': trial.params.get('adaptive_target'),
-                    'adaptive_decay': trial.params.get('adaptive_decay'),
-                    'top_nsigma': trial.params.get('top_nsigma'),
+                    **trial.params,
                     'response_length': trial.user_attrs.get('response_length', 0),
                     'repetition_penalty': trial.user_attrs.get('repetition_penalty', 0.0),
                     'coherence_score': trial.user_attrs.get('coherence_score', 0.0),
@@ -334,30 +220,29 @@ class OptunaParameterSweep:
                     'response_text': trial.user_attrs.get('response_text', ''),
                 }
                 data.append(row)
-        
+
         df = pd.DataFrame(data)
-        
-        # Calculate additional metrics
-        df['overall_score'] = (
-            df['value'] * 0.4 +
-            (1 - df['repetition_penalty']) * 0.3 +
-            df['coherence_score'] * 0.2 +
-            df['readability_score'] * 0.1
-        )
-        
+
+        if len(df) > 0:
+            df['overall_score'] = (
+                df['value'] * 0.4 +
+                (1 - df['repetition_penalty']) * 0.3 +
+                df['coherence_score'] * 0.2 +
+                df['readability_score'] * 0.1
+            )
+
         return df
-    
+
     def generate_summary(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Generate summary statistics from results.
-        
-        Args:
-            df: DataFrame with analyzed results
-            
-        Returns:
-            Dictionary with summary statistics
-        """
-        summary = {
+        """Generate summary statistics from results."""
+        if len(df) == 0:
+            return {'total_trials': 0, 'completed_trials': 0}
+
+        best_idx = df['overall_score'].idxmax()
+        param_cols = ['temperature', 'min_p', 'top_p', 'top_k', 'rep_pen', 'typical']
+        best_params = {c: df.loc[best_idx, c] for c in param_cols if c in df.columns}
+
+        return {
             'total_trials': len(df),
             'completed_trials': len(df),
             'best_quality_score': df['value'].max(),
@@ -368,122 +253,115 @@ class OptunaParameterSweep:
             'avg_repetition_penalty': df['repetition_penalty'].mean(),
             'avg_coherence_score': df['coherence_score'].mean(),
             'avg_readability_score': df['readability_score'].mean(),
-            'best_parameters': df.loc[df['overall_score'].idxmax(), 'parameters'].to_dict() if 'parameters' in df.columns else {},
+            'avg_lazy_score': df['lazy_score'].mean(),
+            'best_parameters': best_params,
         }
-        
-        return summary
-    
+
     def print_summary(self, summary: Dict[str, Any]) -> None:
-        """
-        Print summary statistics in a readable format.
-        
-        Args:
-            summary: Summary statistics dictionary
-        """
+        """Print summary statistics."""
         print("=" * 60)
         print("OPTUNA PARAMETER SWEEP SUMMARY")
         print("=" * 60)
         print()
-        
-        print("📊 GENERAL STATISTICS:")
-        print(f"   Total trials: {summary['total_trials']}")
-        print(f"   Completed trials: {summary['completed_trials']}")
+
+        print("GENERAL:")
+        print(f"   Total completed trials: {summary['completed_trials']}")
         print()
-        
-        print("🎯 QUALITY METRICS:")
-        print(f"   Best quality score: {summary['best_quality_score']:.4f}")
-        print(f"   Average quality score: {summary['avg_quality_score']:.4f}")
-        print(f"   Best overall score: {summary['best_overall_score']:.4f}")
-        print(f"   Average overall score: {summary['avg_overall_score']:.4f}")
+
+        print("QUALITY METRICS:")
+        print(f"   Best quality score:   {summary['best_quality_score']:.4f}")
+        print(f"   Avg quality score:    {summary['avg_quality_score']:.4f}")
+        print(f"   Best overall score:   {summary['best_overall_score']:.4f}")
+        print(f"   Avg overall score:    {summary['avg_overall_score']:.4f}")
         print()
-        
-        print("📝 TEXT METRICS:")
-        print(f"   Average response length: {summary['avg_response_length']:.1f} characters")
-        print(f"   Average repetition penalty: {summary['avg_repetition_penalty']:.4f}")
-        print(f"   Average coherence score: {summary['avg_coherence_score']:.4f}")
-        print(f"   Average readability score: {summary['avg_readability_score']:.4f}")
+
+        print("TEXT METRICS:")
+        print(f"   Avg response length:      {summary['avg_response_length']:.1f} chars")
+        print(f"   Avg repetition penalty:   {summary['avg_repetition_penalty']:.4f}")
+        print(f"   Avg coherence score:      {summary['avg_coherence_score']:.4f}")
+        print(f"   Avg readability score:    {summary['avg_readability_score']:.4f}")
+        print(f"   Avg lazy score:           {summary['avg_lazy_score']:.4f}")
         print()
-        
-        print("✅ BEST PARAMETERS:")
-        best_params = summary['best_parameters']
-        for param, value in best_params.items():
-            print(f"   {param}: {value:.4f}")
+
+        print("BEST PARAMETERS:")
+        for param, value in summary['best_parameters'].items():
+            if isinstance(value, float):
+                print(f"   {param}: {value:.4f}")
+            else:
+                print(f"   {param}: {value}")
         print()
-        
         print("=" * 60)
-
-
-class MockCompletionResponse:
-    """Mock completion response for demonstration"""
-    def __init__(self):
-        self.choices = [MockChoice()]
-
-
-class MockChoice:
-    """Mock choice object for demonstration"""
-    def __init__(self):
-        self.text = "Mock response text"
 
 
 def main():
     """Main function to run the parameter sweep"""
-    
+
     # Configuration
-    MODEL_NAME = "gpt-4"  # Replace with your actual model name
-    PROMPT = """
-    Continue the following story:
-    
-    Once upon a time in a small village nestled between rolling hills, there lived a young girl named Elara.
-    She was known throughout the village for her curiosity and her unusual ability to understand the language of animals.
-    One day, while exploring the forest edge, she heard a faint whimpering sound coming from a dense thicket.
-    
-    <response>
-    """
-    
-    MAX_TRIALS = 50  # Set to a higher number for actual optimization
-    
-    print("🔧 OPTUNA PARAMETER SWEEP FOR LLM OPTIMIZATION")
+    BASE_URL = os.environ.get(
+        "LLM_BASE_URL",
+        "https://poly-wife-replacement-removal.trycloudflare.com/v1",
+    )
+    MODEL_NAME = os.environ.get("LLM_MODEL", "")  # empty = use whatever the server has
+    MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "512"))
+    MAX_TRIALS = int(os.environ.get("SWEEP_MAX_TRIALS", "30"))
+
+    PROMPT = """Continue the following story in vivid, creative prose:
+
+Once upon a time in a small village nestled between rolling hills, there lived a young girl named Elara.
+She was known throughout the village for her curiosity and her unusual ability to understand the language of animals.
+One day, while exploring the forest edge, she heard a faint whimpering sound coming from a dense thicket.
+"""
+
+    # Auto-detect model name if not set
+    if not MODEL_NAME:
+        try:
+            client = OpenAI(base_url=BASE_URL, api_key="not-needed")
+            models = client.models.list()
+            MODEL_NAME = models.data[0].id
+            print(f"Auto-detected model: {MODEL_NAME}")
+        except Exception as e:
+            print(f"Could not auto-detect model: {e}")
+            MODEL_NAME = "default"
+
+    print("OPTUNA PARAMETER SWEEP FOR LLM OPTIMIZATION")
     print("=" * 60)
     print()
-    
-    # Initialize and run the sweep
+
     sweep = OptunaParameterSweep(
+        base_url=BASE_URL,
         model_name=MODEL_NAME,
         prompt=PROMPT,
+        max_tokens=MAX_TOKENS,
         max_trials=MAX_TRIALS,
-        n_jobs=1  # Set to higher value for parallel execution
+        n_jobs=1,
     )
-    
-    # Run the optimization study
+
     study = sweep.run_study()
-    
-    # Save results
+
     results_filename = sweep.save_results(study)
-    
-    # Analyze results
+
     df = sweep.analyze_results(study)
-    summary = sweep.generate_summary(df)
-    
-    # Print summary
-    sweep.print_summary(summary)
-    
-    # Save analyzed results
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    analyzed_filename = f"optuna_parameter_sweep_analyzed_{timestamp}.csv"
-    df.to_csv(analyzed_filename, index=False)
-    print(f"📊 Analyzed results saved to: {analyzed_filename}")
-    
-    # Print best parameters
+    if len(df) > 0:
+        summary = sweep.generate_summary(df)
+        sweep.print_summary(summary)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        analyzed_filename = f"optuna_parameter_sweep_analyzed_{timestamp}.csv"
+        df.to_csv(analyzed_filename, index=False)
+        print(f"Analyzed results saved to: {analyzed_filename}")
+
+        print()
+        print("RECOMMENDED PARAMETERS:")
+        for param, value in study.best_params.items():
+            if isinstance(value, float):
+                print(f"   {param}: {value:.4f}")
+            else:
+                print(f"   {param}: {value}")
+    else:
+        print("No completed trials to analyze.")
+
     print()
-    print("🎯 RECOMMENDED PARAMETERS:")
-    best_params = study.best_params
-    for param, value in best_params.items():
-        print(f"   {param}: {value:.4f}")
-    
-    print()
-    print("✅ Optimization complete!")
-    print(f"   Results saved to: {results_filename}")
-    print(f"   Analyzed data saved to: {analyzed_filename}")
+    print(f"Optimization complete!  Results: {results_filename}")
 
 
 if __name__ == "__main__":

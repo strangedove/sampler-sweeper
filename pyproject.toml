@@ -1,0 +1,15 @@
+[project]
+name = "sampler-sweeper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "nltk>=3.9.2",
+    "numpy",
+    "openai>=2.16.0",
+    "optuna",
+    "pandas",
+    "seaborn>=0.13.2",
+]
