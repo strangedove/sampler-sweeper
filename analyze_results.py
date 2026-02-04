@@ -22,7 +22,7 @@ import seaborn as sns
 from collections import defaultdict, Counter
 import numpy as np
 import re
-from typing import List, Dict, Tuple
+from typing import Any, List, Dict, Tuple
 import string
 
 # For advanced NLP metrics (if available)
@@ -31,10 +31,28 @@ try:
     from nltk.tokenize import word_tokenize, sent_tokenize
     from nltk.corpus import stopwords
     from nltk import ngrams
-    nltk.download('punkt', quiet=True)
-    nltk.download('stopwords', quiet=True)
-    nltk.download('averaged_perceptron_tagger', quiet=True)
-    HAS_NLTK = True
+
+    # Download NLTK data with a timeout so slow connections don't block
+    import threading
+
+    def _nltk_download():
+        for pkg in ('punkt', 'punkt_tab', 'stopwords', 'averaged_perceptron_tagger'):
+            try:
+                nltk.download(pkg, quiet=True)
+            except Exception:
+                pass
+
+    _dl = threading.Thread(target=_nltk_download, daemon=True)
+    _dl.start()
+    _dl.join(timeout=15)  # wait at most 15 seconds
+
+    # Verify the tokenizer actually works; if data is missing fall back
+    try:
+        word_tokenize("test")
+        HAS_NLTK = True
+    except LookupError:
+        HAS_NLTK = False
+        print("NLTK data not yet downloaded - falling back to simple tokenization")
 except ImportError:
     HAS_NLTK = False
     print("NLTK not available - some advanced metrics will be disabled")
@@ -225,119 +243,322 @@ def calculate_readability_metrics(text: str) -> Dict[str, float]:
     }
 
 
-def detect_lazy_uncreative_text(text: str, patterns: List[str] = None) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Default pattern lists for lazy / uncreative text detection
+# ---------------------------------------------------------------------------
+# LITERAL_STRINGS are matched via case-insensitive substring search.
+# Each hit is counted (so the same phrase appearing 3 times = 3 hits).
+DEFAULT_LITERAL_STRINGS: List[str] = [
+    # --- AI-assistant refusal / hedging ---
+    "i don't know",
+    "i cannot",
+    "i can't",
+    "i am unable",
+    "i'm sorry",
+    "sorry, i",
+    "cannot provide",
+    "not available",
+    "beyond my capabilities",
+    "beyond my knowledge",
+    "out of scope",
+    "as an ai",
+    "as a language model",
+
+    # --- Overused AI creative-writing phrases ---
+    "a testament to",
+    "a sense of wonder",
+    "a wave of",
+    "couldn't help but",
+    "couldn't help but smile",
+    "couldn't help but notice",
+    "sent shivers down",
+    "shivers down her spine",
+    "shivers down his spine",
+    "a shiver ran down",
+    "let out a breath",
+    "breath he didn't know",
+    "breath she didn't know",
+    "didn't realize they had been holding",
+    "didn't know he had been holding",
+    "didn't know she had been holding",
+    "a mix of",
+    "a mixture of",
+    "a flicker of",
+    "a surge of",
+    "a pang of",
+    "a rush of",
+    "a jolt of",
+    "a knot formed",
+    "a knot in her stomach",
+    "a knot in his stomach",
+    "heart pounded in",
+    "heart hammered in",
+    "heart raced as",
+    "eyes widened in",
+    "eyes narrowed",
+    "brow furrowed",
+    "jaw clenched",
+    "fists clenched",
+    "the weight of the world",
+    "the weight of it all",
+    "let out a sigh",
+    "a sigh escaped",
+    "tears streamed down",
+    "tears welled up",
+    "tears pricked",
+    "voice barely above a whisper",
+    "barely above a whisper",
+    "voice was barely",
+    "time seemed to stop",
+    "time stood still",
+    "the world seemed to",
+    "the world around them",
+    "the world fell away",
+    "a sense of dread",
+    "a sense of unease",
+    "a chill ran down",
+    "an involuntary shudder",
+    "dark and stormy",
+    "in the blink of an eye",
+    "it was as if",
+    "with bated breath",
+    "swallowed hard",
+    "took a deep breath",
+    "drew a sharp breath",
+    "a sharp intake of breath",
+    "clenched and unclenched",
+    "squared his shoulders",
+    "squared her shoulders",
+    "steeled himself",
+    "steeled herself",
+    "something primal",
+    "every fiber of",
+    "every fibre of",
+    "the silence stretched",
+    "the silence was deafening",
+    "an eternity seemed to pass",
+    "felt like an eternity",
+    "that seemed to last forever",
+    "his blood ran cold",
+    "her blood ran cold",
+    "blood drained from",
+    "a cold sweat",
+
+    # --- Purple prose / melodrama ---
+    "ethereal beauty",
+    "ethereal glow",
+    "orbs" ,  # as synonym for eyes
+    "cerulean",
+    "crimson",
+    "obsidian",
+    "alabaster",
+    "gossamer",
+    "luminous",
+    "iridescent",
+    "effervescent",
+    "resplendent",
+    "undulating",
+    "tantalizing",
+
+    # --- Cliché openers / transitions ---
+    "little did they know",
+    "little did he know",
+    "little did she know",
+    "unbeknownst to",
+    "as fate would have it",
+    "it was then that",
+    "in that moment",
+    "at that very moment",
+    "with a newfound",
+    "newfound determination",
+    "newfound resolve",
+    "newfound sense of",
+    "a newfound appreciation",
+    "with renewed determination",
+    "with renewed vigor",
+
+    # --- Hackneyed descriptions ---
+    "piercing blue eyes",
+    "striking features",
+    "chiseled jaw",
+    "raven-black hair",
+    "raven hair",
+    "porcelain skin",
+    "lithe frame",
+    "slender frame",
+    "towering figure",
+    "imposing figure",
+    "mysterious stranger",
+    "deafening silence",
+    "palpable tension",
+    "thick with tension",
+    "hung in the air",
+    "hung heavy in the air",
+
+    # --- Generic filler / essay-speak ---
+    "the fact that",
+    "the reality is",
+    "it is clear that",
+    "it should be noted",
+    "without a doubt",
+    "however, it is important to note",
+    "in conclusion",
+    "it is worth noting",
+    "needless to say",
+    "it goes without saying",
+
+    # --- Overused metaphors / idioms ---
+    "think outside the box",
+    "at the end of the day",
+    "paradigm shift",
+    "low-hanging fruit",
+    "raise the bar",
+    "tip of the iceberg",
+    "slippery slope",
+    "a double-edged sword",
+    "only time will tell",
+    "the calm before the storm",
+    "light at the end of the tunnel",
+    "a rollercoaster of emotions",
+    "emotions ran high",
+
+    # --- Placeholder / debug text ---
+    "lorem ipsum",
+    "the quick brown fox",
+    "placeholder",
+]
+
+# REGEX_PATTERNS are compiled with re.IGNORECASE. Each pattern is searched
+# (not matched) against the full text. Use these for structural patterns that
+# can't be expressed as simple substrings.
+DEFAULT_REGEX_PATTERNS: List[str] = [
+    # Repeated word (same word 3+ times in a row): "very very very"
+    r'\b(\w+)(?:\s+\1){2,}\b',
+    # Excessive ellipsis abuse (4+ dots or 2+ separate ellipses nearby)
+    r'\.{4,}',
+    r'\.{3}[^.]{0,40}\.{3}',
+    # Exclamation mark spam (3+ in a row)
+    r'!{3,}',
+    # Purple prose: "<noun> of <abstract noun>" chains
+    r'\b(?:eyes|gaze|voice|heart|soul|spirit|mind)\s+of\s+(?:steel|fire|ice|stone|gold|iron|darkness|light)\b',
+    # "Said" synonym abuse — overloaded dialogue tags
+    r'\b(?:exclaimed|proclaimed|declared|announced|stated|remarked|opined|mused|quipped|retorted|interjected|gasped|breathed|murmured|muttered|whispered|hissed|growled|snarled|barked|bellowed|thundered|purred|cooed|crooned)\b',
+    # Starting consecutive sentences with the same word (captures the word)
+    r'(?:^|\n|[.!?]\s+)(\w+)\b[^.!?]*[.!?]\s+\1\b[^.!?]*[.!?]\s+\1\b',
+    # Adverb-verb cliché clusters
+    r'\b(?:slowly|gently|softly|quietly|carefully|suddenly|quickly)\s+(?:reached|moved|walked|turned|looked|whispered|spoke|opened|closed|touched|pulled|pushed)\b',
+]
+
+
+def detect_lazy_uncreative_text(
+    text: str,
+    literal_strings: List[str] = None,
+    regex_patterns: List[str] = None,
+    patterns: List[str] = None,  # legacy compat: treated as literal_strings
+) -> Dict[str, Any]:
     """
     Detect lazy/uncreative text patterns in responses.
-    
+
+    Matching is split into two categories:
+      1. **Literal strings** — case-insensitive substring search. Every
+         occurrence in the text is counted (so "a wave of ... a wave of"
+         counts as 2 hits).
+      2. **Regex patterns** — compiled with ``re.IGNORECASE`` and searched
+         against the original text. ``findall`` is used so multiple matches
+         are counted.
+
     Args:
-        text: The text to analyze
-        patterns: List of literal strings or regex patterns to match
-                 If None, uses a default set of common lazy/uncreative patterns
-    
+        text: The text to analyze.
+        literal_strings: Case-insensitive literal substrings to look for.
+            If *None*, ``DEFAULT_LITERAL_STRINGS`` is used.
+        regex_patterns: Regex pattern strings (compiled internally).
+            If *None*, ``DEFAULT_REGEX_PATTERNS`` is used.
+        patterns: Legacy parameter — if provided and *literal_strings* is
+            None, these are used as literal strings for backward compat.
+
     Returns:
-        Dictionary with detection results including:
-        - lazy_pattern_count: Number of matches found
-        - lazy_patterns_found: List of matched patterns
-        - lazy_score: Score from 0-1 (higher = more lazy/uncreative)
-        - has_lazy_text: Boolean indicating if any patterns were found
+        Dictionary with:
+        - lazy_pattern_count: Total number of match *instances* found
+        - lazy_patterns_found: List of (pattern, count) tuples
+        - lazy_score: 0–1 (higher = more lazy/uncreative)
+        - has_lazy_text: Boolean
     """
     if not text or not isinstance(text, str):
         return {
             'lazy_pattern_count': 0,
             'lazy_patterns_found': [],
             'lazy_score': 0.0,
-            'has_lazy_text': False
+            'has_lazy_text': False,
         }
-    
-    # Default patterns for lazy/uncreative text
-    if patterns is None:
-        patterns = [
-            # Common uncreative responses
-            r'i don\'t know',
-            r'i cannot',
-            r'i can\'t',
-            r'i am unable',
-            r'i\'m sorry',
-            r'sorry, i',
-            r'not sure',
-            r'unknown',
-            r'no information',
-            r'cannot provide',
-            r'not available',
-            r'out of scope',
-            r'beyond my knowledge',
-            r'beyond my capabilities',
-            
-            # Filler phrases
-            r'the quick brown fox',
-            r'lorem ipsum',
-            r'to be or not to be',
-            r'once upon a time',
-            r'however, it is important to note',
-            r'in conclusion',
-            
-            # Repetitive structures (3+ repetitions of same phrase)
-            r'(\b\w+\s+){3,}(\1\s+){3,}',
-            
-            # Generic filler
-            r'\bthe fact that\b',
-            r'\bthe reality is\b',
-            r'\bit is clear that\b',
-            r'\bit should be noted\b',
-            r'\bwithout a doubt\b',
-            
-            # Overused metaphors/clichés
-            r'\bthink outside the box\b',
-            r'\bat the end of the day\b',
-            r'\bparadigm shift\b',
-            r'\blow-hanging fruit\b',
-            r'\braise the bar\b',
-            
-            # Placeholder text
-            r'\bplaceholder\b',
-            r'\bTODO\b',
-            r'\bFIXME\b',
-            r'\bXXX\b',
-        ]
-    
+
+    # Resolve which lists to use
+    if literal_strings is None:
+        literal_strings = list(patterns) if patterns is not None else DEFAULT_LITERAL_STRINGS
+    if regex_patterns is None and patterns is None:
+        regex_patterns = DEFAULT_REGEX_PATTERNS
+    elif regex_patterns is None:
+        regex_patterns = []
+
     text_lower = text.lower()
-    matches = []
-    
-    for pattern in patterns:
+    found: List[Tuple[str, int]] = []  # (pattern_or_string, hit_count)
+    total_hits = 0
+
+    # --- Literal string matching (case-insensitive, count every occurrence) ---
+    for s in literal_strings:
+        s_lower = s.lower()
+        count = text_lower.count(s_lower)
+        if count > 0:
+            found.append((s, count))
+            total_hits += count
+
+    # --- Regex pattern matching ---
+    for pat in regex_patterns:
         try:
-            # Compile regex pattern
-            if not pattern.startswith('^') and not pattern.endswith('$'):
-                # Make it case-insensitive and allow partial matches
-                regex = re.compile(pattern, re.IGNORECASE)
-            else:
-                regex = re.compile(pattern)
-            
-            if regex.search(text_lower):
-                matches.append(pattern)
+            compiled = re.compile(pat, re.IGNORECASE)
+            hits = compiled.findall(text)
+            if hits:
+                found.append((pat, len(hits)))
+                total_hits += len(hits)
         except re.error:
-            # If pattern is not valid regex, treat as literal string
-            if pattern.lower() in text_lower:
-                matches.append(pattern)
-    
-    # Calculate lazy score (0-1, higher = more lazy/uncreative)
-    # Normalize by text length to account for longer responses
-    text_length = len(text)
-    if text_length == 0:
-        lazy_score = 0.0
-    else:
-        # Score is proportional to number of matches, inversely proportional to text length
-        lazy_score = min(1.0, len(matches) / max(1, text_length / 100))
-    
+            # Malformed regex — skip silently
+            pass
+
+    # --- Scoring ---
+    # We want a score in [0, 1] that:
+    #   - accounts for how many hits there are relative to text length
+    #   - saturates smoothly (diminishing returns past a certain density)
+    #
+    # density = total_hits per 500 chars of text (roughly per paragraph)
+    # score   = 1 - 1/(1 + density)   (shifted hyperbola, 0→0, inf→1)
+    word_count = max(1, len(text.split()))
+    density = total_hits / (word_count / 100.0)  # hits per 100 words
+    lazy_score = 1.0 - 1.0 / (1.0 + density)
+
     return {
-        'lazy_pattern_count': len(matches),
-        'lazy_patterns_found': matches,
+        'lazy_pattern_count': total_hits,
+        'lazy_patterns_found': found,
         'lazy_score': lazy_score,
-        'has_lazy_text': len(matches) > 0
+        'has_lazy_text': total_hits > 0,
     }
 
 
-def analyze_text_quality(text: str, lazy_patterns: List[str] = None) -> Dict[str, float]:
-    """Comprehensive text quality analysis with lazy text detection"""
+def analyze_text_quality(
+    text: str,
+    lazy_patterns: List[str] = None,
+    lazy_literal_strings: List[str] = None,
+    lazy_regex_patterns: List[str] = None,
+) -> Dict[str, float]:
+    """Comprehensive text quality analysis with lazy text detection.
+
+    Args:
+        text: The text to analyze.
+        lazy_patterns: Legacy shorthand — passed as literal strings if
+            *lazy_literal_strings* is not provided.
+        lazy_literal_strings: Explicit literal-string list for lazy
+            text detection (overrides *lazy_patterns*).
+        lazy_regex_patterns: Explicit regex-pattern list for lazy text
+            detection.
+    """
     if not text or not isinstance(text, str):
         return {
             'quality_score': 0.0,
@@ -347,12 +568,17 @@ def analyze_text_quality(text: str, lazy_patterns: List[str] = None) -> Dict[str
             'lazy_score': 0.0,
             'overall_quality': 0.0
         }
-    
+
     # Get all metrics
     repetition_metrics = calculate_repetition_metrics(text)
     coherence_metrics = calculate_coherence_metrics(text)
     readability_metrics = calculate_readability_metrics(text)
-    lazy_metrics = detect_lazy_uncreative_text(text, lazy_patterns)
+    lazy_metrics = detect_lazy_uncreative_text(
+        text,
+        literal_strings=lazy_literal_strings,
+        regex_patterns=lazy_regex_patterns,
+        patterns=lazy_patterns,
+    )
     
     # Calculate overall quality score (weighted average)
     # Penalize lazy text heavily since it indicates poor creativity

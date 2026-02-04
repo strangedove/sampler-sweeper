@@ -114,6 +114,8 @@ class OptunaParameterSweep:
         trial.set_user_attr('repetition_penalty', quality_metrics['repetition_penalty'])
         trial.set_user_attr('coherence_score', quality_metrics['coherence_score'])
         trial.set_user_attr('readability_score', quality_metrics['readability_score'])
+        trial.set_user_attr('lazy_score', quality_metrics.get('lazy_score', 0.0))
+        trial.set_user_attr('lazy_pattern_count', quality_metrics.get('lazy_pattern_count', 0))
         
         # Prune trials with very low quality
         if score < 0.1:
@@ -327,6 +329,8 @@ class OptunaParameterSweep:
                     'repetition_penalty': trial.user_attrs.get('repetition_penalty', 0.0),
                     'coherence_score': trial.user_attrs.get('coherence_score', 0.0),
                     'readability_score': trial.user_attrs.get('readability_score', 0.0),
+                    'lazy_score': trial.user_attrs.get('lazy_score', 0.0),
+                    'lazy_pattern_count': trial.user_attrs.get('lazy_pattern_count', 0),
                     'response_text': trial.user_attrs.get('response_text', ''),
                 }
                 data.append(row)
