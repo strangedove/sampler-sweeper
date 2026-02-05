@@ -13,6 +13,7 @@ sweep:
   n_jobs: 1
   study_name: "llm_parameter_optimization"
   top_n: 10              # number of top trials in the readable .md report
+  label: ""              # optional label for output filenames (overrides model name)
 
 # Each parameter: name: [min, max]
 # Type is auto-detected: both bounds are int -> int, otherwise float.

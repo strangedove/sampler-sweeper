@@ -19,6 +19,7 @@ from collections import Counter
 import optuna
 import json
 import os
+import re
 import time
 from typing import Dict, Any, List, Optional
 import yaml
@@ -89,7 +90,8 @@ class OptunaParameterSweep:
                  n_jobs: int = 1,
                  study_name: str = "llm_parameter_optimization",
                  storage: Optional[str] = None,
-                 api_key: str = "not-needed"):
+                 api_key: str = "not-needed",
+                 label: str = ""):
         self.base_url = base_url
         self.model_name = model_name
         self.prompt = prompt
@@ -99,9 +101,23 @@ class OptunaParameterSweep:
         self.n_jobs = n_jobs
         self.study_name = study_name
         self.storage = storage
+        self.label = label
         self.parameter_space = parameter_space or parse_parameter_space(DEFAULT_PARAMETERS)
 
         self.client = OpenAI(base_url=base_url, api_key=api_key)
+
+    @property
+    def run_suffix(self) -> str:
+        """File-name suffix: label > model name > timestamp."""
+        raw = self.label or self.model_name or ""
+        if raw:
+            # Sanitize: keep alphanumerics, hyphens, underscores, dots
+            safe = re.sub(r'[^a-zA-Z0-9._-]', '_', raw)
+            # Collapse runs of underscores and strip leading/trailing
+            safe = re.sub(r'_+', '_', safe).strip('_')
+            if safe:
+                return safe
+        return time.strftime("%Y%m%d_%H%M%S")
 
     # ------------------------------------------------------------------
     # Optuna objective
@@ -218,8 +234,7 @@ class OptunaParameterSweep:
     def save_results(self, study: optuna.Study, filename: Optional[str] = None) -> str:
         """Save optimization results to JSON file."""
         if filename is None:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"optuna_parameter_sweep_results_{timestamp}.json"
+            filename = f"optuna_parameter_sweep_results_{self.run_suffix}.json"
 
         results = []
         for trial in study.trials:
@@ -385,8 +400,7 @@ class OptunaParameterSweep:
         be skimmed quickly by a human reviewer or fed to a judge model.
         """
         if filename is None:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"sweep_top_results_{timestamp}.md"
+            filename = f"sweep_top_results_{self.run_suffix}.md"
 
         if len(df) == 0:
             with open(filename, 'w') as f:
@@ -526,6 +540,7 @@ def main():
     n_jobs = 1
     study_name = "llm_parameter_optimization"
     top_n = 10
+    label = ""
     prompt = DEFAULT_PROMPT
     params_dict = dict(DEFAULT_PARAMETERS)
 
@@ -543,6 +558,7 @@ def main():
         n_jobs = sweep_cfg.get('n_jobs', n_jobs)
         study_name = sweep_cfg.get('study_name', study_name)
         top_n = sweep_cfg.get('top_n', top_n)
+        label = sweep_cfg.get('label', label)
 
         if 'prompt' in cfg:
             prompt = cfg['prompt']
@@ -580,6 +596,7 @@ def main():
         n_jobs=n_jobs,
         study_name=study_name,
         api_key=api_key,
+        label=label,
     )
 
     study = sweep.run_study()
@@ -592,8 +609,7 @@ def main():
         sweep.print_summary(summary)
         sweep.print_pattern_summary(study)
 
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        analyzed_filename = f"optuna_parameter_sweep_analyzed_{timestamp}.csv"
+        analyzed_filename = f"optuna_parameter_sweep_analyzed_{sweep.run_suffix}.csv"
         df.to_csv(analyzed_filename, index=False)
         print(f"Analyzed results saved to: {analyzed_filename}")
 
