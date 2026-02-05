@@ -16,6 +16,7 @@ Dependencies (automatically handled by UV):
 import json
 import os
 import time
+import yaml
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -574,289 +575,52 @@ def calculate_prose_quality_metrics(text: str) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 # Default pattern lists for lazy / uncreative text detection
 # ---------------------------------------------------------------------------
-# LITERAL_STRINGS are matched via case-insensitive substring search.
-# Each hit is counted (so the same phrase appearing 3 times = 3 hits).
-DEFAULT_LITERAL_STRINGS: List[str] = [
-    # --- AI-assistant refusal / hedging ---
-    "i don't know",
-    "i cannot",
-    "i can't",
-    "i am unable",
-    "i'm sorry",
-    "sorry, i",
-    "cannot provide",
-    "not available",
-    "beyond my capabilities",
-    "beyond my knowledge",
-    "out of scope",
-    "as an ai",
-    "as a language model",
+# Patterns are loaded from slop_patterns.yaml if present, otherwise use
+# minimal fallback patterns. The YAML file has two sections:
+#   - literal_strings: case-insensitive substring matches
+#   - regex_patterns: regular expressions (compiled with re.IGNORECASE)
 
-    # --- Overused AI creative-writing phrases ---
-    "a testament to",
-    "a sense of wonder",
-    "a wave of",
-    "couldn't help but",
-    "couldn't help but smile",
-    "couldn't help but notice",
-    "sent shivers down",
-    "shivers down her spine",
-    "shivers down his spine",
-    "a shiver ran down",
-    "let out a breath",
-    "breath he didn't know",
-    "breath she didn't know",
-    "didn't realize they had been holding",
-    "didn't know he had been holding",
-    "didn't know she had been holding",
-    "a mix of",
-    "a mixture of",
-    "a flicker of",
-    "a surge of",
-    "a pang of",
-    "a rush of",
-    "a jolt of",
-    "a knot formed",
-    "a knot in her stomach",
-    "a knot in his stomach",
-    "heart pounded in",
-    "heart hammered in",
-    "heart raced as",
-    "eyes widened in",
-    "eyes narrowed",
-    "brow furrowed",
-    "jaw clenched",
-    "fists clenched",
-    "the weight of the world",
-    "the weight of it all",
-    "let out a sigh",
-    "a sigh escaped",
-    "tears streamed down",
-    "tears welled up",
-    "tears pricked",
-    "voice barely above a whisper",
-    "barely above a whisper",
-    "voice was barely",
-    "time seemed to stop",
-    "time stood still",
-    "the world seemed to",
-    "the world around them",
-    "the world fell away",
-    "a sense of dread",
-    "a sense of unease",
-    "a chill ran down",
-    "an involuntary shudder",
-    "dark and stormy",
-    "in the blink of an eye",
-    "it was as if",
-    "with bated breath",
-    "swallowed hard",
-    "took a deep breath",
-    "drew a sharp breath",
-    "a sharp intake of breath",
-    "clenched and unclenched",
-    "squared his shoulders",
-    "squared her shoulders",
-    "steeled himself",
-    "steeled herself",
-    "something primal",
-    "every fiber of",
-    "every fibre of",
-    "the silence stretched",
-    "the silence was deafening",
-    "an eternity seemed to pass",
-    "felt like an eternity",
-    "that seemed to last forever",
-    "his blood ran cold",
-    "her blood ran cold",
-    "blood drained from",
-    "a cold sweat",
-
-    # --- Purple prose / melodrama ---
-    "ethereal beauty",
-    "ethereal glow",
-    "orbs" ,  # as synonym for eyes
-    "cerulean",
-    "crimson",
-    "obsidian",
-    "alabaster",
-    "gossamer",
-    "luminous",
-    "iridescent",
-    "effervescent",
-    "resplendent",
-    "undulating",
-    "tantalizing",
-
-    # --- Cliché openers / transitions ---
-    "little did they know",
-    "little did he know",
-    "little did she know",
-    "unbeknownst to",
-    "as fate would have it",
-    "it was then that",
-    "in that moment",
-    "at that very moment",
-    "with a newfound",
-    "newfound determination",
-    "newfound resolve",
-    "newfound sense of",
-    "a newfound appreciation",
-    "with renewed determination",
-    "with renewed vigor",
-
-    # --- Hackneyed descriptions ---
-    "piercing blue eyes",
-    "striking features",
-    "chiseled jaw",
-    "raven-black hair",
-    "raven hair",
-    "porcelain skin",
-    "lithe frame",
-    "slender frame",
-    "towering figure",
-    "imposing figure",
-    "mysterious stranger",
-    "deafening silence",
-    "palpable tension",
-    "thick with tension",
-    "hung in the air",
-    "hung heavy in the air",
-
-    # --- Generic filler / essay-speak ---
-    "the fact that",
-    "the reality is",
-    "it is clear that",
-    "it should be noted",
-    "without a doubt",
-    "however, it is important to note",
-    "in conclusion",
-    "it is worth noting",
-    "needless to say",
-    "it goes without saying",
-
-    # --- Overused metaphors / idioms ---
-    "think outside the box",
-    "at the end of the day",
-    "paradigm shift",
-    "low-hanging fruit",
-    "raise the bar",
-    "tip of the iceberg",
-    "slippery slope",
-    "a double-edged sword",
-    "only time will tell",
-    "the calm before the storm",
-    "light at the end of the tunnel",
-    "a rollercoaster of emotions",
-    "emotions ran high",
-
-    # --- Placeholder / debug text ---
-    "lorem ipsum",
-    "the quick brown fox",
-    "placeholder",
-
-    # --- AI slop vocabulary (overused "fancy" words) ---
-    "Eldoria",
-    "Lumina",
-    "ethereal",
-    "celestial",
-    "resplendent",
-    "kaleidoscopic",
-    "gloaming",
-    "gossamer",       # also in purple prose above, but deduped at search time
-    "tapestry",
-    "symphony",
-    "gilded",
-    "azure",
-    "obsidian",       # dupe — harmless, counted once per occurrence
-    "crimson",        # dupe
-    "sapphire",
-    "ruby",
-    "emerald",
-    "sentinel",
-    "conflagration of",
-    "velvet",
-    "moonlit",
-    "moonless",
-    "twilight",
-    "sultry",
-    "melancholic",
-    "stark contrast",
-    "inky",
-    "bustling",
-    "abyss",
-    "gnarled",
-    "profound",
-    "beloved",
-    "cosmos",
-    "devoid",
-    "trepidation",
-    "sun-kissed",
-    "boundless",
-    "lullaby",
-    "labyrinth",
-    "unyielding",
-    "ensnared",
-    "fiery",
-    "raven",
-    "twin pools",
-    "beacon",
-    "testament",
-    "embodiment",
-    "flicker",
-    "specter",
-    "cinematic",
-    "etched with",
-    "the very air",
-    "veil of",
-    "bathed in",
-    "painting the",
-    "gleaming with",
-    "faintest hint",
-    "a pang of",       # dupe
-    "thick with",
-    "the air was",
-    "rise and fall",
-    "slither",
-    "caress",
-    "adrift",
-    "abuzz",
-    "perpetually",
-    "hue",
-    "purr",
-    "entangled",
-    "scarcely believe",
-    "defied the very",
-    "the very notion",
-    "the halls of",
-    "shattered like",
-    "yearned for",
-    "realm",
-    "neon lights",
-    "a thousand ships",
-    "Elara",          # AI's favourite character name
+# Minimal fallback patterns (used only if YAML file is missing)
+_FALLBACK_LITERAL_STRINGS: List[str] = [
+    "couldn't help but", "a wave of", "steeled himself", "steeled herself",
+    "eyes widened", "let out a breath", "palpable tension", "mysterious stranger",
+]
+_FALLBACK_REGEX_PATTERNS: List[str] = [
+    r'\b(\w+)(?:\s+\1){2,}\b',  # repeated words
 ]
 
-# REGEX_PATTERNS are compiled with re.IGNORECASE. Each pattern is searched
-# (not matched) against the full text. Use these for structural patterns that
-# can't be expressed as simple substrings.
-DEFAULT_REGEX_PATTERNS: List[str] = [
-    # Repeated word (same word 3+ times in a row): "very very very"
-    r'\b(\w+)(?:\s+\1){2,}\b',
-    # Excessive ellipsis abuse (4+ dots or 2+ separate ellipses nearby)
-    r'\.{4,}',
-    r'\.{3}[^.]{0,40}\.{3}',
-    # Exclamation mark spam (3+ in a row)
-    r'!{3,}',
-    # Purple prose: "<noun> of <abstract noun>" chains
-    r'\b(?:eyes|gaze|voice|heart|soul|spirit|mind)\s+of\s+(?:steel|fire|ice|stone|gold|iron|darkness|light)\b',
-    # "Said" synonym abuse — overloaded dialogue tags
-    r'\b(?:exclaimed|proclaimed|declared|announced|stated|remarked|opined|mused|quipped|retorted|interjected|gasped|breathed|murmured|muttered|whispered|hissed|growled|snarled|barked|bellowed|thundered|purred|cooed|crooned)\b',
-    # Starting consecutive sentences with the same word (captures the word)
-    r'(?:^|\n|[.!?]\s+)(\w+)\b[^.!?]*[.!?]\s+\1\b[^.!?]*[.!?]\s+\1\b',
-    # Adverb-verb cliché clusters
-    r'\b(?:slowly|gently|softly|quietly|carefully|suddenly|quickly)\s+(?:reached|moved|walked|turned|looked|whispered|spoke|opened|closed|touched|pulled|pushed)\b',
-]
+
+def load_slop_patterns(yaml_path: str = None) -> Tuple[List[str], List[str]]:
+    """
+    Load slop detection patterns from a YAML file.
+
+    Args:
+        yaml_path: Path to YAML file. If None, looks for 'slop_patterns.yaml'
+            in the same directory as this script.
+
+    Returns:
+        Tuple of (literal_strings, regex_patterns) lists.
+        Falls back to minimal built-in patterns if file is missing or invalid.
+    """
+    if yaml_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        yaml_path = os.path.join(script_dir, 'slop_patterns.yaml')
+
+    try:
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        literal_strings = data.get('literal_strings', [])
+        regex_patterns = data.get('regex_patterns', [])
+        if not literal_strings and not regex_patterns:
+            raise ValueError("Empty patterns file")
+        return literal_strings, regex_patterns
+    except Exception:
+        # Fall back to minimal built-in patterns
+        return _FALLBACK_LITERAL_STRINGS, _FALLBACK_REGEX_PATTERNS
+
+
+# Load default patterns at import time
+DEFAULT_LITERAL_STRINGS, DEFAULT_REGEX_PATTERNS = load_slop_patterns()
 
 
 def detect_lazy_uncreative_text(

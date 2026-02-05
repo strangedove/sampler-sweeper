@@ -119,11 +119,13 @@ Combines lexical diversity (unique words / total words) with a penalty for exces
 
 #### Lazy Score (0-1) -- "Slop Detection"
 
-Detects AI writing cliches and overused phrases. Two detection modes:
+Detects AI writing cliches and overused phrases. Patterns are loaded from `slop_patterns.yaml` (editable):
 
-- **~94 literal phrases** matched case-insensitively: "couldn't help but smile", "a wave of warmth", "steeled herself", "newfound determination", "palpable tension", etc.
+- **~240 literal phrases** matched case-insensitively: "couldn't help but smile", "a wave of warmth", "steeled herself", "newfound determination", "palpable tension", etc.
 - **8 regex patterns** for structural problems: repeated words in consecutive sentences, ellipsis spam, purple prose noun-chains ("eyes of steel"), dialogue tag abuse ("exclaimed/proclaimed/declared"), adverb-verb cliches ("slowly reached"), etc.
 - Includes slop vocabulary from the [Heretic](https://huggingface.co/collections/DavidAU/heretic-series-672f06d26ad3bbee52e8a8b8) config: Elara, Lumina, Eldoria, tapestry, sentinel, kaleidoscopic, etc.
+
+To customize the patterns, edit `slop_patterns.yaml` directly. The file has two sections: `literal_strings` (case-insensitive substring matches) and `regex_patterns` (compiled with `re.IGNORECASE`).
 
 Scoring uses a hyperbolic curve: `1 - 1/(1 + density)` where density = pattern hits per 100 words. Light slop barely registers; heavy slop saturates toward 1.0.
 
@@ -172,7 +174,8 @@ The biggest differentiator between human and AI text is the lazy score (slop), n
 | File | Description |
 |---|---|
 | `optuna_parameter_sweep.py` | Main sweep script |
-| `analyze_results.py` | Text quality analysis module (~1620 lines) |
+| `analyze_results.py` | Text quality analysis module |
+| `slop_patterns.yaml` | Editable list of lazy/slop patterns (~240 phrases + 8 regexes) |
 | `sweep_config.example.yaml` | Example YAML config |
 | `analyze_chat_results.py` | Standalone analyzer for chat-format results (not actively maintained) |
 
