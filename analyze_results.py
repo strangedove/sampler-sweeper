@@ -295,6 +295,283 @@ def calculate_readability_metrics(text: str) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
+# "Telling" verbs — weak constructions like "she felt sad" instead of showing
+# ---------------------------------------------------------------------------
+TELLING_VERBS = {
+    'seemed', 'felt', 'realized', 'knew', 'noticed', 'sensed',
+    'understood', 'recognized', 'appeared', 'looked',  # "looked" as "looked happy"
+    'sounded', 'wondered', 'thought', 'decided', 'believed',
+}
+
+
+def calculate_prose_quality_metrics(text: str) -> Dict[str, float]:
+    """Measure prose-craft signals that aren't covered by repetition/slop checks.
+
+    Returns a dict with individual metrics AND a composite ``prose_penalty``
+    (0 = no problems, approaches 1.0 for severely monotonous / staccato /
+    tell-heavy prose).
+
+    Metrics computed
+    ----------------
+    sentence_start_monotony : float  0-1
+        How repetitive the first word(s) of each sentence are.  Measured via
+        normalised entropy of the (first_word,) distribution. 0 = every
+        sentence starts differently, 1 = every sentence starts the same way.
+
+    word_frequency_spike : float  0-1
+        Worst-case overuse of any single non-stopword, expressed as a 0-1
+        penalty.  "seemed" appearing 8× in 400 words would score high.
+
+    sentence_length_uniformity : float  0-1
+        Inverse of sentence-length coefficient of variation.  Prose where
+        every sentence is the same length scores near 1.  Good prose with
+        varied rhythm scores near 0.
+
+    telling_verb_density : float  0-1
+        Proportion of sentences that contain a "telling" verb (seemed, felt,
+        realized …).  High density → tell-don't-show writing.
+
+    paragraph_uniformity : float  0-1
+        How uniform paragraph lengths are.  Pure staccato (every paragraph is
+        one sentence) or pure wall-of-text (single giant block) both score
+        high.  Mixed paragraph lengths score low.
+
+    dialogue_narration_balance : float  0-1
+        Penalty for having ALL dialogue or ALL narration.  A healthy mix
+        scores 0; 100 % one mode scores ~0.5 (mild penalty — some stories
+        legitimately have no dialogue).
+
+    prose_penalty : float  0-1
+        Composite of the above, designed so that moderate issues across
+        several dimensions don't stack too harshly, but a single severe
+        problem still registers.
+    """
+    defaults = {
+        'sentence_start_monotony': 0.0,
+        'word_frequency_spike': 0.0,
+        'sentence_length_uniformity': 0.0,
+        'telling_verb_density': 0.0,
+        'paragraph_uniformity': 0.0,
+        'dialogue_narration_balance': 0.0,
+        'prose_penalty': 0.0,
+    }
+
+    if not text or not isinstance(text, str):
+        return defaults
+
+    # --- Sentence splitting ------------------------------------------------
+    if HAS_NLTK:
+        sentences = sent_tokenize(text)
+    else:
+        sentences = re.split(r'[.!?]+', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+    if len(sentences) < 3:
+        return defaults  # too little text to judge
+
+    # --- Tokenise for word-level stats ------------------------------------
+    if HAS_NLTK:
+        all_tokens = word_tokenize(text)
+        words = [w.lower() for w in all_tokens if w.isalpha()]
+        try:
+            stop_words = set(stopwords.words('english'))
+        except LookupError:
+            stop_words = set()
+    else:
+        words = [w.lower() for w in re.findall(r'[a-zA-Z]+', text)]
+        # Minimal stopword set if NLTK unavailable
+        stop_words = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to',
+            'for', 'of', 'with', 'by', 'from', 'is', 'was', 'are', 'were',
+            'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'could', 'should', 'may', 'might', 'shall',
+            'not', 'no', 'nor', 'so', 'yet', 'as', 'if', 'it', 'its',
+            'that', 'this', 'these', 'those', 'i', 'me', 'my', 'we', 'our',
+            'you', 'your', 'he', 'him', 'his', 'she', 'her', 'they', 'them',
+            'their', 'what', 'which', 'who', 'whom', 'how', 'when', 'where',
+            'there', 'here', 'all', 'each', 'every', 'both', 'few', 'more',
+            'most', 'other', 'some', 'such', 'than', 'too', 'very', 'just',
+            'about', 'up', 'out', 'then', 'into',
+        }
+
+    word_count = len(words)
+    if word_count < 20:
+        return defaults
+
+    # ======================================================================
+    # 1. Sentence-start monotony
+    # ======================================================================
+    # Take the first word of each sentence (lowered, alpha only)
+    first_words = []
+    for s in sentences:
+        m = re.match(r'["\']?\s*([a-zA-Z]+)', s)
+        if m:
+            first_words.append(m.group(1).lower())
+
+    if first_words:
+        fw_counts = Counter(first_words)
+        n = len(first_words)
+        # Shannon entropy of the first-word distribution
+        entropy = -sum((c / n) * np.log2(c / n) for c in fw_counts.values())
+        # Maximum entropy for n items with k unique values
+        max_entropy = np.log2(n) if n > 1 else 1.0
+        # Normalise: 1 = all same, 0 = all different
+        normalised_entropy = 1.0 - (entropy / max_entropy) if max_entropy > 0 else 0.0
+        # Also check the *dominant* first word — if one pronoun starts >50%
+        # of sentences, that's monotonous regardless of entropy
+        most_common_frac = fw_counts.most_common(1)[0][1] / n
+        # Blend: entropy catches overall flatness, dominant-fraction catches
+        # "she she she" specifically
+        sentence_start_monotony = max(normalised_entropy, most_common_frac - 0.3)
+        sentence_start_monotony = np.clip(sentence_start_monotony, 0.0, 1.0)
+    else:
+        sentence_start_monotony = 0.0
+
+    # ======================================================================
+    # 2. Non-stopword frequency spike
+    # ======================================================================
+    content_words = [w for w in words if w not in stop_words and len(w) > 2]
+    if content_words:
+        cw_counts = Counter(content_words)
+        # Density = occurrences per 100 words for the most-repeated content word
+        worst_density = cw_counts.most_common(1)[0][1] / (word_count / 100.0)
+        # A content word appearing 1× per 100 words is normal.
+        # 3× per 100 words is noticeable.  5+ is bad.
+        # Sigmoid curve: 0 at density≤1, ~0.5 at density=3, ~0.8 at density=5
+        word_frequency_spike = 1.0 - 1.0 / (1.0 + max(0, worst_density - 1.0) / 2.0)
+    else:
+        word_frequency_spike = 0.0
+
+    # ======================================================================
+    # 3. Sentence-length uniformity
+    # ======================================================================
+    sent_lengths = [len(s.split()) for s in sentences]
+    mean_len = np.mean(sent_lengths)
+    std_len = np.std(sent_lengths)
+    # Coefficient of variation — good prose has CV ≈ 0.4-0.8
+    cv = std_len / mean_len if mean_len > 0 else 0.0
+    # Low CV = monotonous rhythm.  We penalise CV < 0.3 heavily, 0.3-0.5
+    # mildly, >0.5 not at all.
+    if cv >= 0.5:
+        sentence_length_uniformity = 0.0
+    elif cv >= 0.2:
+        # Linear ramp from 0 at cv=0.5 to ~0.7 at cv=0.2
+        sentence_length_uniformity = (0.5 - cv) / 0.3 * 0.7
+    else:
+        sentence_length_uniformity = 0.7 + (0.2 - cv) / 0.2 * 0.3
+
+    # ======================================================================
+    # 4. Telling-verb density
+    # ======================================================================
+    telling_count = 0
+    for s in sentences:
+        s_words = set(re.findall(r'[a-zA-Z]+', s.lower()))
+        if s_words & TELLING_VERBS:
+            telling_count += 1
+    telling_ratio = telling_count / len(sentences)
+    # Up to 30% of sentences having a telling verb is fine.
+    # 50%+ is problematic.  80%+ is terrible.
+    if telling_ratio <= 0.3:
+        telling_verb_density = 0.0
+    else:
+        telling_verb_density = min(1.0, (telling_ratio - 0.3) / 0.5)
+
+    # ======================================================================
+    # 5. Paragraph structure
+    # ======================================================================
+    # Split on double-newlines (or treat the whole text as one paragraph)
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text]
+
+    n_para = len(paragraphs)
+    if n_para == 1:
+        # Single wall of text — mild penalty (some completions are short
+        # enough that one paragraph is fine)
+        para_sent_counts = [len(sentences)]
+        paragraph_uniformity = 0.3 if len(sentences) > 8 else 0.0
+    else:
+        # Count sentences per paragraph
+        para_sent_counts = []
+        for p in paragraphs:
+            if HAS_NLTK:
+                p_sents = sent_tokenize(p)
+            else:
+                p_sents = [s.strip() for s in re.split(r'[.!?]+', p) if s.strip()]
+            para_sent_counts.append(max(1, len(p_sents)))
+
+        mean_ps = np.mean(para_sent_counts)
+        std_ps = np.std(para_sent_counts)
+        cv_para = std_ps / mean_ps if mean_ps > 0 else 0.0
+
+        # Staccato detection: if mean paragraph is ~1 sentence and there
+        # are many paragraphs, that's the annoying one-line-paragraph style
+        if mean_ps <= 1.5 and n_para >= 6:
+            staccato = 0.6
+        elif mean_ps <= 2.0 and n_para >= 8:
+            staccato = 0.4
+        else:
+            staccato = 0.0
+
+        # Uniformity: same logic as sentence length — low CV = every
+        # paragraph is the same size = boring
+        if cv_para >= 0.4:
+            uniformity = 0.0
+        else:
+            uniformity = (0.4 - cv_para) / 0.4 * 0.4
+
+        paragraph_uniformity = max(staccato, uniformity)
+
+    # ======================================================================
+    # 6. Dialogue / narration balance
+    # ======================================================================
+    # Count lines that look like dialogue (contain quoted speech)
+    dialogue_sents = 0
+    for s in sentences:
+        if re.search(r'["\u201c\u201d]', s) or re.search(r"['\u2018\u2019].*said", s, re.I):
+            dialogue_sents += 1
+
+    dialogue_frac = dialogue_sents / len(sentences) if sentences else 0.0
+    # Ideal range is roughly 0.15 - 0.60.
+    # All-narration (0%) gets a small penalty.  All-dialogue (100%) gets a
+    # bigger one.  We use a U-shaped curve centred around 0.35.
+    if 0.10 <= dialogue_frac <= 0.65:
+        dialogue_narration_balance = 0.0
+    elif dialogue_frac < 0.10:
+        # No dialogue — mild penalty, some stories legitimately have none
+        dialogue_narration_balance = (0.10 - dialogue_frac) / 0.10 * 0.25
+    else:
+        # Mostly dialogue — bigger penalty
+        dialogue_narration_balance = min(0.6, (dialogue_frac - 0.65) / 0.35 * 0.6)
+
+    # ======================================================================
+    # Composite prose penalty
+    # ======================================================================
+    # Weighted average — sentence start monotony and telling density are the
+    # most noticeable flaws, followed by rhythm issues.
+    prose_penalty = (
+        sentence_start_monotony * 0.30 +
+        word_frequency_spike * 0.20 +
+        sentence_length_uniformity * 0.15 +
+        telling_verb_density * 0.15 +
+        paragraph_uniformity * 0.10 +
+        dialogue_narration_balance * 0.10
+    )
+    # Clamp
+    prose_penalty = np.clip(prose_penalty, 0.0, 1.0)
+
+    return {
+        'sentence_start_monotony': float(sentence_start_monotony),
+        'word_frequency_spike': float(word_frequency_spike),
+        'sentence_length_uniformity': float(sentence_length_uniformity),
+        'telling_verb_density': float(telling_verb_density),
+        'paragraph_uniformity': float(paragraph_uniformity),
+        'dialogue_narration_balance': float(dialogue_narration_balance),
+        'prose_penalty': float(prose_penalty),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Default pattern lists for lazy / uncreative text detection
 # ---------------------------------------------------------------------------
 # LITERAL_STRINGS are matched via case-insensitive substring search.
@@ -705,28 +982,29 @@ def analyze_text_quality(
     repetition_metrics = calculate_repetition_metrics(text)
     coherence_metrics = calculate_coherence_metrics(text)
     readability_metrics = calculate_readability_metrics(text)
+    prose_metrics = calculate_prose_quality_metrics(text)
     lazy_metrics = detect_lazy_uncreative_text(
         text,
         literal_strings=lazy_literal_strings,
         regex_patterns=lazy_regex_patterns,
         patterns=lazy_patterns,
     )
-    
+
     # Calculate overall quality score
-    # The repetition_penalty already uses max(ngram, block) so severe
-    # looping drives it toward 1.0.  We multiply the base score by
-    # (1 - rep_penalty) so that highly repetitive text is crushed
-    # regardless of how well the other metrics look.
+    # Base score: weighted blend of positive signals
     lazy_penalty = lazy_metrics['lazy_score']
     rep_penalty = repetition_metrics['repetition_penalty']
+    prose_pen = prose_metrics['prose_penalty']
 
     base_quality = (
         coherence_metrics['coherence_score'] * 0.30 +
         readability_metrics['readability_score'] * 0.30 +
         (1.0 - lazy_penalty) * 0.40
     )
-    # Multiplicative penalty: rep_penalty=0 → no effect, rep_penalty=1 → score→0
-    overall_quality = base_quality * (1.0 - rep_penalty)
+    # Multiplicative penalties: each one independently crushes the score
+    # when severe, but mild values across multiple dimensions don't
+    # stack too harshly (e.g. 0.9 * 0.9 * 0.9 = 0.73, not 0.3).
+    overall_quality = base_quality * (1.0 - rep_penalty) * (1.0 - prose_pen)
     
     # Combine all metrics
     all_metrics = {
@@ -742,6 +1020,7 @@ def analyze_text_quality(
     all_metrics.update(repetition_metrics)
     all_metrics.update(coherence_metrics)
     all_metrics.update(readability_metrics)
+    all_metrics.update(prose_metrics)
     all_metrics.update(lazy_metrics)
     
     return all_metrics
