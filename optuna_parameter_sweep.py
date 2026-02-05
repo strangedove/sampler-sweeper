@@ -375,6 +375,131 @@ class OptunaParameterSweep:
             print(f"  {display:<45} {total_hits:>5}  {n_trials:>6}  {pct:>6.1f}%")
         print("=" * 60)
 
+    def generate_top_results_report(self, study: optuna.Study, df: pd.DataFrame,
+                                     top_n: int = 10,
+                                     filename: Optional[str] = None) -> str:
+        """Generate a human-readable markdown report of the top N trials.
+
+        The report includes a sweep summary header, then each trial's sampler
+        parameters, quality metrics, and the full generated text -- designed to
+        be skimmed quickly by a human reviewer or fed to a judge model.
+        """
+        if filename is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"sweep_top_results_{timestamp}.md"
+
+        if len(df) == 0:
+            with open(filename, 'w') as f:
+                f.write("# Sweep Results\n\nNo completed trials.\n")
+            return filename
+
+        # Sort by overall_score descending, take top N
+        top = df.nlargest(top_n, 'overall_score').copy()
+
+        param_cols = [p['name'] for p in self.parameter_space]
+        score_cols = ['overall_score', 'coherence_score', 'readability_score',
+                      'lazy_score', 'repetition_penalty', 'prose_penalty',
+                      'sentence_start_monotony', 'word_frequency_spike',
+                      'telling_verb_density']
+
+        lines: list[str] = []
+        lines.append(f"# Sweep Top {len(top)} Results")
+        lines.append("")
+        lines.append(f"**Model:** {self.model_name}  ")
+        lines.append(f"**Total trials:** {len(df)}  ")
+        lines.append(f"**Score range:** {df['overall_score'].min():.3f} -- {df['overall_score'].max():.3f} "
+                      f"(mean {df['overall_score'].mean():.3f})  ")
+        lines.append(f"**Parameters swept:** {', '.join(param_cols)}")
+        lines.append("")
+
+        # Compact summary table
+        lines.append("## Quick Comparison")
+        lines.append("")
+        header = f"| Rank | Trial | Score |"
+        sep = "|---:|---:|---:|"
+        for col in param_cols:
+            header += f" {col} |"
+            sep += "---:|"
+        header += " lazy | prose_pen | rep_pen |"
+        sep += "---:|---:|---:|"
+        lines.append(header)
+        lines.append(sep)
+
+        for rank, (_, row) in enumerate(top.iterrows(), 1):
+            line = f"| {rank} | #{int(row['trial'])} | {row['overall_score']:.3f} |"
+            for col in param_cols:
+                val = row.get(col, 0)
+                line += f" {val:.2f} |" if isinstance(val, float) else f" {val} |"
+            line += f" {row['lazy_score']:.2f} | {row['prose_penalty']:.2f} | {row['repetition_penalty']:.2f} |"
+            lines.append(line)
+
+        lines.append("")
+
+        # Detailed per-trial sections
+        lines.append("---")
+        lines.append("")
+        for rank, (_, row) in enumerate(top.iterrows(), 1):
+            trial_num = int(row['trial'])
+            lines.append(f"## #{rank}: Trial {trial_num} (score: {row['overall_score']:.3f})")
+            lines.append("")
+
+            # Parameters
+            lines.append("### Sampler Parameters")
+            lines.append("")
+            lines.append("| Parameter | Value |")
+            lines.append("|---|---|")
+            for col in param_cols:
+                val = row.get(col, 'N/A')
+                if isinstance(val, float):
+                    lines.append(f"| {col} | {val:.4f} |")
+                else:
+                    lines.append(f"| {col} | {val} |")
+            lines.append("")
+
+            # Scores
+            lines.append("### Quality Metrics")
+            lines.append("")
+            lines.append("| Metric | Value |")
+            lines.append("|---|---|")
+            for col in score_cols:
+                val = row.get(col, 0.0)
+                lines.append(f"| {col} | {val:.3f} |")
+            lines.append("")
+
+            # Slop patterns if any
+            lazy_count = int(row.get('lazy_pattern_count', 0))
+            if lazy_count > 0:
+                # Look up the patterns from the study's trial attrs
+                for trial in study.trials:
+                    if trial.number == trial_num:
+                        pats = trial.user_attrs.get('lazy_patterns_found', [])
+                        if pats:
+                            lines.append(f"**Slop patterns found ({lazy_count} total hits):** "
+                                         + ", ".join(f"{p} ({c}x)" for p, c in pats[:10]))
+                            lines.append("")
+                        break
+
+            # Generated text
+            lines.append("### Generated Text")
+            lines.append("")
+            text = row.get('response_text', '')
+            if text:
+                lines.append("```")
+                lines.append(text.strip())
+                lines.append("```")
+            else:
+                lines.append("*(text not available)*")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+        report = "\n".join(lines)
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(report)
+
+        print(f"Top {len(top)} results report saved to: {filename}")
+        return filename
+
 
 DEFAULT_PROMPT = """Continue the following story in vivid, creative prose:
 
@@ -400,6 +525,7 @@ def main():
     max_trials = int(os.environ.get("SWEEP_MAX_TRIALS", "30"))
     n_jobs = 1
     study_name = "llm_parameter_optimization"
+    top_n = 10
     prompt = DEFAULT_PROMPT
     params_dict = dict(DEFAULT_PARAMETERS)
 
@@ -416,6 +542,7 @@ def main():
         max_trials = sweep_cfg.get('max_trials', max_trials)
         n_jobs = sweep_cfg.get('n_jobs', n_jobs)
         study_name = sweep_cfg.get('study_name', study_name)
+        top_n = sweep_cfg.get('top_n', top_n)
 
         if 'prompt' in cfg:
             prompt = cfg['prompt']
@@ -469,6 +596,9 @@ def main():
         analyzed_filename = f"optuna_parameter_sweep_analyzed_{timestamp}.csv"
         df.to_csv(analyzed_filename, index=False)
         print(f"Analyzed results saved to: {analyzed_filename}")
+
+        # Generate human-readable top results report
+        sweep.generate_top_results_report(study, df, top_n=top_n)
 
         print()
         print("RECOMMENDED PARAMETERS:")

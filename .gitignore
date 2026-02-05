@@ -6,6 +6,7 @@ __pycache__/
 # Sweep result files (timestamped)
 optuna_parameter_sweep_results_*.json
 optuna_parameter_sweep_analyzed_*.csv
+sweep_top_results_*.md
 
 # Local notes
 note-to-claude.txt
