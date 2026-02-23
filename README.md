@@ -101,11 +101,11 @@ sweep_top_results_apertus-8b-run1.md
 The quality score is a composite designed to reward coherent, lexically diverse prose while penalizing repetition, cliches, and flat writing. It's computed as:
 
 ```
-base  = coherence * 0.30 + readability * 0.30 + (1 - lazy_score) * 0.40
+base  = coherence * 0.20 + readability * 0.20 + (1 - lazy_score) * 0.30 + slop_guard * 0.30
 score = base * (1 - repetition_penalty) * (1 - prose_penalty)
 ```
 
-The multiplicative penalties mean that severe repetition or flat prose crushes the score regardless of other metrics.
+The lazy score catches phrase-level cliches via pattern matching, while `slop_guard` detects structural and rhetorical AI tells (see below). The multiplicative penalties mean that severe repetition or flat prose crushes the score regardless of other metrics.
 
 ### Component Metrics
 
@@ -128,6 +128,10 @@ Detects AI writing cliches and overused phrases. Patterns are loaded from `slop_
 To customize the patterns, edit `slop_patterns.yaml` directly. The file has two sections: `literal_strings` (case-insensitive substring matches) and `regex_patterns` (compiled with `re.IGNORECASE`).
 
 Scoring uses a hyperbolic curve: `1 - 1/(1 + density)` where density = pattern hits per 100 words. Light slop barely registers; heavy slop saturates toward 1.0.
+
+#### Slop Guard (0-100)
+
+Structural and rhetorical AI-tell detection via [slop-guard](https://github.com/eric-tramel/slop-guard). While the lazy score above catches specific phrases, slop-guard uses a broader pattern-matching approach to detect AI-characteristic writing patterns at the structural level -- things like formulaic paragraph rhythms, hedging language clusters, and rhetorical tells that aren't tied to any single phrase. Returns a score from 0-100 (higher = cleaner), normalized to 0-1 for the composite formula. Falls back gracefully to a neutral 0.5 if the module isn't installed.
 
 #### Repetition Penalty (0-1)
 
@@ -175,7 +179,8 @@ The biggest differentiator between human and AI text is the lazy score (slop), n
 |---|---|
 | `optuna_parameter_sweep.py` | Main sweep script |
 | `analyze_results.py` | Text quality analysis module |
-| `slop_patterns.yaml` | Editable list of lazy/slop patterns (~240 phrases + 8 regexes) |
+| `slop_guard.py` | Structural AI-tell detection from [slop-guard](https://github.com/eric-tramel/slop-guard) |
+| `slop_patterns.yaml` | Editable list of lazy/slop patterns (~240 phrases + 9 regexes) |
 | `sweep_config.example.yaml` | Example YAML config |
 | `analyze_chat_results.py` | Standalone analyzer for chat-format results (not actively maintained) |
 
