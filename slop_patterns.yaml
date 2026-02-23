@@ -293,3 +293,6 @@ regex_patterns:
 
   # Adverb-verb cliche clusters
   - '\b(?:slowly|gently|softly|quietly|carefully|suddenly|quickly)\s+(?:reached|moved|walked|turned|looked|whispered|spoke|opened|closed|touched|pulled|pushed)\b'
+
+  # "tasted like X and Y" -- AI-characteristic concrete+abstract sensory pairing
+  - '\btasted\s+(?:like|of)\s+\w+\s+and\s+'

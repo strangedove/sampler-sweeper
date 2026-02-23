@@ -155,6 +155,9 @@ class OptunaParameterSweep:
         trial.set_user_attr('sentence_start_monotony', quality_metrics.get('sentence_start_monotony', 0.0))
         trial.set_user_attr('word_frequency_spike', quality_metrics.get('word_frequency_spike', 0.0))
         trial.set_user_attr('telling_verb_density', quality_metrics.get('telling_verb_density', 0.0))
+        trial.set_user_attr('slop_guard_score', quality_metrics.get('slop_guard_score', 50.0))
+        trial.set_user_attr('slop_guard_band', quality_metrics.get('slop_guard_band', 'unknown'))
+        trial.set_user_attr('slop_guard_violations', quality_metrics.get('slop_guard_violations', 0))
         # Store the specific patterns that matched (list of [pattern, count])
         patterns_found = quality_metrics.get('lazy_patterns_found', [])
         trial.set_user_attr('lazy_patterns_found',
@@ -276,6 +279,9 @@ class OptunaParameterSweep:
                     'sentence_start_monotony': trial.user_attrs.get('sentence_start_monotony', 0.0),
                     'word_frequency_spike': trial.user_attrs.get('word_frequency_spike', 0.0),
                     'telling_verb_density': trial.user_attrs.get('telling_verb_density', 0.0),
+                    'slop_guard_score': trial.user_attrs.get('slop_guard_score', 50.0),
+                    'slop_guard_band': trial.user_attrs.get('slop_guard_band', 'unknown'),
+                    'slop_guard_violations': trial.user_attrs.get('slop_guard_violations', 0),
                     'response_text': trial.user_attrs.get('response_text', ''),
                 }
                 data.append(row)
@@ -284,12 +290,13 @@ class OptunaParameterSweep:
 
         if len(df) > 0:
             # Mirror the formula from analyze_results.analyze_text_quality:
-            # base = coherence*0.3 + readability*0.3 + (1-lazy)*0.4
+            # base = coherence*0.2 + readability*0.2 + (1-lazy)*0.3 + slop_guard*0.3
             # overall = base * (1 - repetition_penalty) * (1 - prose_penalty)
             base = (
-                df['coherence_score'] * 0.30 +
-                df['readability_score'] * 0.30 +
-                (1 - df['lazy_score']) * 0.40
+                df['coherence_score'] * 0.20 +
+                df['readability_score'] * 0.20 +
+                (1 - df['lazy_score']) * 0.30 +
+                (df['slop_guard_score'] / 100.0) * 0.30
             )
             df['overall_score'] = base * (1 - df['repetition_penalty']) * (1 - df['prose_penalty'])
 

@@ -26,6 +26,15 @@ import re
 from typing import Any, List, Dict, Tuple
 import string
 
+# Slop-guard: structural/rhetorical AI-tell detection
+# (from https://github.com/eric-tramel/slop-guard, MCP wrapper stripped)
+try:
+    from slop_guard import analyze as slop_guard_analyze
+    HAS_SLOP_GUARD = True
+except ImportError:
+    HAS_SLOP_GUARD = False
+    print("slop_guard module not found - structural AI-tell detection disabled")
+
 # For advanced NLP metrics (if available)
 try:
     import nltk
@@ -739,6 +748,9 @@ def analyze_text_quality(
             'coherence_score': 0.0,
             'readability_score': 0.0,
             'lazy_score': 0.0,
+            'slop_guard_score': 50.0,
+            'slop_guard_band': 'unknown',
+            'slop_guard_violations': 0,
             'overall_quality': 0.0
         }
 
@@ -754,6 +766,20 @@ def analyze_text_quality(
         patterns=lazy_patterns,
     )
 
+    # Slop-guard: structural/rhetorical AI-tell detection
+    if HAS_SLOP_GUARD:
+        sg_result = slop_guard_analyze(text)
+        slop_guard_score = sg_result.get('score', 50.0)       # 0-100, higher = cleaner
+        slop_guard_band = sg_result.get('band', 'unknown')
+        slop_guard_violations = len(sg_result.get('violations', []))
+    else:
+        slop_guard_score = 50.0   # neutral default when module unavailable
+        slop_guard_band = 'unavailable'
+        slop_guard_violations = 0
+
+    # Normalise slop-guard score to 0-1 (higher = better, matching our convention)
+    slop_guard_normalized = slop_guard_score / 100.0
+
     # Calculate overall quality score
     # Base score: weighted blend of positive signals
     lazy_penalty = lazy_metrics['lazy_score']
@@ -761,15 +787,16 @@ def analyze_text_quality(
     prose_pen = prose_metrics['prose_penalty']
 
     base_quality = (
-        coherence_metrics['coherence_score'] * 0.30 +
-        readability_metrics['readability_score'] * 0.30 +
-        (1.0 - lazy_penalty) * 0.40
+        coherence_metrics['coherence_score'] * 0.20 +
+        readability_metrics['readability_score'] * 0.20 +
+        (1.0 - lazy_penalty) * 0.30 +
+        slop_guard_normalized * 0.30
     )
     # Multiplicative penalties: each one independently crushes the score
     # when severe, but mild values across multiple dimensions don't
     # stack too harshly (e.g. 0.9 * 0.9 * 0.9 = 0.73, not 0.3).
     overall_quality = base_quality * (1.0 - rep_penalty) * (1.0 - prose_pen)
-    
+
     # Combine all metrics
     all_metrics = {
         'quality_score': overall_quality,
@@ -777,16 +804,19 @@ def analyze_text_quality(
         'coherence_score': coherence_metrics['coherence_score'],
         'readability_score': readability_metrics['readability_score'],
         'lazy_score': lazy_metrics['lazy_score'],
+        'slop_guard_score': slop_guard_score,
+        'slop_guard_band': slop_guard_band,
+        'slop_guard_violations': slop_guard_violations,
         'overall_quality': overall_quality
     }
-    
+
     # Add all individual metrics
     all_metrics.update(repetition_metrics)
     all_metrics.update(coherence_metrics)
     all_metrics.update(readability_metrics)
     all_metrics.update(prose_metrics)
     all_metrics.update(lazy_metrics)
-    
+
     return all_metrics
 
 
@@ -812,6 +842,9 @@ def analyze_results(results: list, custom_lazy_patterns: List[str] = None) -> pd
                 'lazy_score': 0.0,
                 'lazy_pattern_count': 0,
                 'has_lazy_text': False,
+                'slop_guard_score': 50.0,
+                'slop_guard_band': 'unknown',
+                'slop_guard_violations': 0,
                 'token_repetition_rate': 0.0,
                 'bigram_repetition_rate': 0.0,
                 'trigram_repetition_rate': 0.0,
@@ -839,6 +872,9 @@ def analyze_results(results: list, custom_lazy_patterns: List[str] = None) -> pd
                 'lazy_score': 0.0,
                 'lazy_pattern_count': 0,
                 'has_lazy_text': False,
+                'slop_guard_score': 50.0,
+                'slop_guard_band': 'unknown',
+                'slop_guard_violations': 0,
                 'token_repetition_rate': 0.0,
                 'bigram_repetition_rate': 0.0,
                 'trigram_repetition_rate': 0.0,
@@ -870,6 +906,9 @@ def analyze_results(results: list, custom_lazy_patterns: List[str] = None) -> pd
             'lazy_score': quality_metrics['lazy_score'],
             'lazy_pattern_count': quality_metrics['lazy_pattern_count'],
             'has_lazy_text': quality_metrics['has_lazy_text'],
+            'slop_guard_score': quality_metrics['slop_guard_score'],
+            'slop_guard_band': quality_metrics['slop_guard_band'],
+            'slop_guard_violations': quality_metrics['slop_guard_violations'],
             'token_repetition_rate': quality_metrics['token_repetition_rate'],
             'bigram_repetition_rate': quality_metrics['bigram_repetition_rate'],
             'trigram_repetition_rate': quality_metrics['trigram_repetition_rate'],
