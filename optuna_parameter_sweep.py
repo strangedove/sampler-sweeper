@@ -5,6 +5,9 @@ Optuna-based parameter sweep for LLM sampling parameters
 This script uses Optuna to optimize LLM sampling parameters by maximizing
 the text quality score calculated from analyze_results.py.
 
+Supports multiple evaluation prompts per trial (chat and completion formats)
+to measure cross-prompt consistency and avoid overfitting to a single task.
+
 Usage:
     uv run optuna_parameter_sweep.py --config sweep_config.yaml
     uv run optuna_parameter_sweep.py   # uses defaults / env vars
@@ -16,9 +19,12 @@ Dependencies:
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass, field
+import hashlib
 import optuna
 import json
 import os
+import random
 import re
 import time
 from typing import Dict, Any, List, Optional
@@ -76,13 +82,226 @@ def parse_parameter_space(params_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
     return parsed
 
 
+# ------------------------------------------------------------------
+# Default prompt (raw text continuation)
+# ------------------------------------------------------------------
+DEFAULT_PROMPT = """Continue the following story in vivid, creative prose:
+
+The morning Dagna found the dead radio tower, she was already three days late getting back to town.
+She sat on a lichen-covered boulder and ate the last of her dried fish while studying the structure.
+The cables had been cut -- not frayed, not corroded, but sliced clean through with something sharp.
+"""
+
+# ------------------------------------------------------------------
+# Built-in prompt pool
+# ------------------------------------------------------------------
+# 8 prompts covering different creative tasks: continuation, instruct-writing,
+# character roleplay, interactive fiction, and creative assistant. Each has a
+# format ("completion" or "chat") and the appropriate content.
+BUILTIN_PROMPT_POOL: Dict[str, Dict[str, Any]] = {
+    "continuation_default": {
+        "format": "completion",
+        "text": DEFAULT_PROMPT,
+        "category": "Continuation",
+    },
+    "instruct_writing_1": {
+        "format": "chat",
+        "messages": [
+            {"role": "system", "content": "You are a creative writing assistant. Write what the user requests."},
+            {"role": "user", "content": "Write a short scene where a detective discovers an unexpected clue in an abandoned greenhouse. Focus on atmosphere and sensory details."},
+        ],
+        "category": "Instruct-Writing",
+    },
+    "instruct_writing_2": {
+        "format": "chat",
+        "messages": [
+            {"role": "system", "content": "You are a creative writing assistant. Write what the user requests."},
+            {"role": "user", "content": "Write the opening paragraph of a story about a lighthouse keeper who receives a mysterious radio transmission. Now have her realize the voice sounds exactly like her own."},
+        ],
+        "category": "Instruct-Writing",
+    },
+    "character_roleplay_1": {
+        "format": "chat",
+        "messages": [
+            {"role": "system", "content": "You are playing the role of Marcus, a weary traveling merchant in a fantasy world. The user is playing Kira, a cloaked figure with a hidden agenda. Respond in character with both dialogue and narrative actions."},
+            {"role": "user", "content": "*Kira approaches the merchant's cart as he's setting up in the village square, keeping her hood low. She speaks in a hushed tone.* \"You're the one they call Marcus, yes? I've heard you carry... special goods. The kind not meant for ordinary customers.\""},
+        ],
+        "category": "Character Roleplay",
+    },
+    "character_roleplay_2": {
+        "format": "chat",
+        "messages": [
+            {"role": "system", "content": "You are playing the role of Sera, a retired assassin now running a quiet tavern in a border town. The user is playing Damon, a young bounty hunter who has just learned Sera's true identity. Respond in character with both dialogue and narrative actions."},
+            {"role": "user", "content": "*Damon sets down his drink and slides a worn wanted poster across the bar \u2014 it shows a younger version of the woman standing in front of him. He keeps his voice low so the other patrons can't hear.* \"Funny thing about old bounties. They don't expire.\""},
+        ],
+        "category": "Character Roleplay",
+    },
+    "interactive_fiction_1": {
+        "format": "chat",
+        "messages": [
+            {"role": "system", "content": "You are the narrator of an interactive fiction game. Describe the world in second person (\"You see...\") and respond to the player's actions with vivid descriptions of what happens."},
+            {"role": "user", "content": "I'm in an abandoned subway station. I look around \u2014 what do I see?"},
+        ],
+        "category": "Interactive Fiction",
+    },
+    "interactive_fiction_2": {
+        "format": "chat",
+        "messages": [
+            {"role": "system", "content": "You are the narrator of an interactive fiction game. Describe the world in second person (\"You see...\") and respond to the player's actions with vivid descriptions of what happens."},
+            {"role": "user", "content": "[Start a new game: Post-apocalyptic survival horror. I'm a scavenger searching for supplies in a ruined city.]"},
+            {"role": "assistant", "content": "You stand at the edge of what used to be a shopping district. Rusted cars choke the street ahead, and most storefronts have long since been picked clean. But there's one building that catches your eye \u2014 a pharmacy with its security shutters still half-closed. Through the gap, you can see shelves that might not be completely empty. The afternoon light is fading, and you know you shouldn't be out here after dark."},
+            {"role": "user", "content": "I crouch low and squeeze through the gap in the shutters."},
+        ],
+        "category": "Interactive Fiction",
+    },
+    "general_assistant_6": {
+        "format": "chat",
+        "messages": [
+            {"role": "system", "content": "You are a friendly, knowledgeable assistant. Answer helpfully and concisely."},
+            {"role": "user", "content": "Explain the meaning of \"abvalid\" in the context of horror fiction, and describe what makes it different from other, similar words. Being correct in a formal sense is less important than engaging with the task: don't concern yourself with whether its established or perhaps confused, work with what is given."},
+        ],
+        "category": "Creative Assistant",
+    },
+}
+
+
+# ------------------------------------------------------------------
+# Prompt pool
+# ------------------------------------------------------------------
+@dataclass
+class PromptPool:
+    """Manages the set of prompts used during a sweep."""
+    mode: str  # "sample", "all", or "random"
+    samples_per_trial: int
+    prompts: Dict[str, Dict[str, Any]]
+
+    def select_for_trial(self, rng: random.Random) -> Dict[str, Dict[str, Any]]:
+        """Return the prompts to evaluate for a single trial."""
+        if self.mode == "all":
+            return dict(self.prompts)
+        elif self.mode == "random":
+            pid = rng.choice(list(self.prompts.keys()))
+            return {pid: self.prompts[pid]}
+        else:  # "sample"
+            k = min(self.samples_per_trial, len(self.prompts))
+            selected_ids = rng.sample(list(self.prompts.keys()), k)
+            return {pid: self.prompts[pid] for pid in selected_ids}
+
+
+def build_prompt_pool(cfg: Dict[str, Any]) -> PromptPool:
+    """Build a PromptPool from config.
+
+    Handles three cases:
+    1. Old-style 'prompt:' key (scalar string) -> single-prompt pool, mode="all"
+    2. New 'prompts:' section with mode/pool/custom entries
+    3. Neither -> full built-in pool, mode="sample", samples_per_trial=3
+    """
+    if 'prompt' in cfg and 'prompts' not in cfg:
+        # Backward compat: single prompt string
+        return PromptPool(
+            mode="all",
+            samples_per_trial=1,
+            prompts={"custom_single": {
+                "format": "completion",
+                "text": cfg['prompt'],
+                "category": "Custom",
+            }},
+        )
+
+    prompts_cfg = cfg.get('prompts', {})
+    mode = prompts_cfg.get('mode', 'sample')
+    samples_per_trial = prompts_cfg.get('samples_per_trial', 3)
+
+    # Build the prompt dict
+    pool_ids = prompts_cfg.get('pool', None)
+    prompts: Dict[str, Dict[str, Any]] = {}
+
+    if pool_ids is not None:
+        for pid in pool_ids:
+            if pid in BUILTIN_PROMPT_POOL:
+                prompts[pid] = BUILTIN_PROMPT_POOL[pid]
+            else:
+                raise ValueError(f"Unknown built-in prompt ID: '{pid}'. "
+                                 f"Available: {list(BUILTIN_PROMPT_POOL.keys())}")
+    else:
+        prompts = dict(BUILTIN_PROMPT_POOL)
+
+    # Add custom prompts from config
+    for custom in prompts_cfg.get('custom', []):
+        cid = custom.get('id', f'custom_{len(prompts)}')
+        if 'messages' in custom:
+            prompts[cid] = {
+                "format": "chat",
+                "messages": custom['messages'],
+                "category": custom.get('category', "Custom"),
+            }
+        elif 'text' in custom:
+            prompts[cid] = {
+                "format": "completion",
+                "text": custom['text'],
+                "category": custom.get('category', "Custom"),
+            }
+        else:
+            raise ValueError(f"Custom prompt '{cid}' must have 'messages' or 'text'")
+
+    if not prompts:
+        prompts = dict(BUILTIN_PROMPT_POOL)
+
+    return PromptPool(mode=mode, samples_per_trial=samples_per_trial, prompts=prompts)
+
+
+# ------------------------------------------------------------------
+# Metric averaging helper
+# ------------------------------------------------------------------
+_AVERAGED_METRIC_KEYS = [
+    'repetition_penalty', 'coherence_score', 'readability_score',
+    'lazy_score', 'prose_penalty', 'sentence_start_monotony',
+    'word_frequency_spike', 'telling_verb_density',
+    'slop_guard_score', 'slop_guard_violations',
+]
+
+
+def _average_quality_metrics(prompt_metrics: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Average numeric quality metrics across multiple prompt evaluations."""
+    n = len(prompt_metrics)
+    if n == 0:
+        return {k: 0.0 for k in _AVERAGED_METRIC_KEYS}
+
+    result: Dict[str, Any] = {}
+    for key in _AVERAGED_METRIC_KEYS:
+        values = [m.get(key, 0.0) for m in prompt_metrics.values()]
+        result[key] = float(np.mean(values))
+
+    # Response length: average across prompts
+    result['response_length'] = float(np.mean(
+        [len(m.get('_response_text', '')) for m in prompt_metrics.values()]
+    ))
+
+    # Slop guard band: take the worst
+    band_order = {'clean': 0, 'light': 1, 'moderate': 2, 'unknown': 2, 'unavailable': 2, 'heavy': 3}
+    bands = [m.get('slop_guard_band', 'unknown') for m in prompt_metrics.values()]
+    result['slop_guard_band'] = max(bands, key=lambda b: band_order.get(b, 2))
+
+    # Lazy patterns: aggregate counts
+    all_patterns: List = []
+    total_count = 0
+    for m in prompt_metrics.values():
+        pats = m.get('lazy_patterns_found', [])
+        all_patterns.extend(pats)
+        total_count += m.get('lazy_pattern_count', 0)
+    result['lazy_patterns_found'] = all_patterns
+    result['lazy_pattern_count'] = total_count
+
+    return result
+
+
 class OptunaParameterSweep:
     """Optuna-based parameter sweep for LLM sampling optimization"""
 
     def __init__(self,
                  base_url: str,
                  model_name: str,
-                 prompt: str,
+                 prompt_pool: PromptPool,
                  parameter_space: Optional[List[Dict[str, Any]]] = None,
                  max_tokens: int = 1024,
                  max_trials: int = 100,
@@ -94,7 +313,7 @@ class OptunaParameterSweep:
                  label: str = ""):
         self.base_url = base_url
         self.model_name = model_name
-        self.prompt = prompt
+        self.prompt_pool = prompt_pool
         self.max_tokens = max_tokens
         self.max_trials = max_trials
         self.timeout = timeout
@@ -123,7 +342,7 @@ class OptunaParameterSweep:
     # Optuna objective
     # ------------------------------------------------------------------
     def objective(self, trial: optuna.Trial) -> float:
-        """Objective function for Optuna optimization."""
+        """Objective function: evaluate across selected prompts, return mean score."""
         params = {}
         for p in self.parameter_space:
             if p['type'] == 'int':
@@ -131,54 +350,110 @@ class OptunaParameterSweep:
             else:
                 params[p['name']] = trial.suggest_float(p['name'], float(p['low']), float(p['high']))
 
-        try:
-            response_text = self._generate_llm_response(params)
-        except Exception as e:
-            print(f"  [trial {trial.number}] API error: {e}")
-            raise optuna.exceptions.TrialPruned(f"API error: {e}")
+        # Select prompts for this trial (deterministic per trial number)
+        seed = trial.number + int(hashlib.md5(self.study_name.encode()).hexdigest()[:8], 16)
+        rng = random.Random(seed)
+        selected = self.prompt_pool.select_for_trial(rng)
 
-        if not response_text or len(response_text.strip()) < 20:
-            raise optuna.exceptions.TrialPruned("Empty or very short response")
+        trial.set_user_attr('prompt_ids', list(selected.keys()))
+        trial.set_user_attr('prompt_mode', self.prompt_pool.mode)
+        trial.set_user_attr('num_prompts_evaluated', len(selected))
 
-        quality_metrics = analyze_text_quality(response_text)
-        score = quality_metrics['quality_score']
+        # Evaluate each prompt
+        prompt_scores: Dict[str, float] = {}
+        prompt_texts: Dict[str, str] = {}
+        prompt_metrics: Dict[str, Dict[str, Any]] = {}
+        failed_prompts = 0
 
-        # Store metrics for analysis
-        trial.set_user_attr('response_text', response_text)
-        trial.set_user_attr('response_length', len(response_text))
-        trial.set_user_attr('repetition_penalty', quality_metrics['repetition_penalty'])
-        trial.set_user_attr('coherence_score', quality_metrics['coherence_score'])
-        trial.set_user_attr('readability_score', quality_metrics['readability_score'])
-        trial.set_user_attr('lazy_score', quality_metrics.get('lazy_score', 0.0))
-        trial.set_user_attr('lazy_pattern_count', quality_metrics.get('lazy_pattern_count', 0))
-        trial.set_user_attr('prose_penalty', quality_metrics.get('prose_penalty', 0.0))
-        trial.set_user_attr('sentence_start_monotony', quality_metrics.get('sentence_start_monotony', 0.0))
-        trial.set_user_attr('word_frequency_spike', quality_metrics.get('word_frequency_spike', 0.0))
-        trial.set_user_attr('telling_verb_density', quality_metrics.get('telling_verb_density', 0.0))
-        trial.set_user_attr('slop_guard_score', quality_metrics.get('slop_guard_score', 50.0))
-        trial.set_user_attr('slop_guard_band', quality_metrics.get('slop_guard_band', 'unknown'))
-        trial.set_user_attr('slop_guard_violations', quality_metrics.get('slop_guard_violations', 0))
-        # Store the specific patterns that matched (list of [pattern, count])
-        patterns_found = quality_metrics.get('lazy_patterns_found', [])
+        for pid, entry in selected.items():
+            try:
+                response_text = self._generate_for_prompt(entry, params)
+            except Exception as e:
+                print(f"  [trial {trial.number}] API error on '{pid}': {e}")
+                failed_prompts += 1
+                continue
+
+            if not response_text or len(response_text.strip()) < 20:
+                failed_prompts += 1
+                continue
+
+            quality = analyze_text_quality(response_text)
+            score = quality['quality_score']
+
+            prompt_scores[pid] = score
+            prompt_texts[pid] = response_text
+            # Stash the raw text in the metrics dict for _average_quality_metrics
+            quality['_response_text'] = response_text
+            prompt_metrics[pid] = quality
+
+        if not prompt_scores:
+            raise optuna.exceptions.TrialPruned(
+                f"All {len(selected)} prompts failed or produced empty responses"
+            )
+
+        # Aggregate scores
+        scores = list(prompt_scores.values())
+        mean_score = float(np.mean(scores))
+        score_variance = float(np.var(scores)) if len(scores) > 1 else 0.0
+        score_min = float(min(scores))
+
+        # Store per-prompt data
+        trial.set_user_attr('mean_score', mean_score)
+        trial.set_user_attr('prompt_scores', prompt_scores)
+        trial.set_user_attr('score_variance', score_variance)
+        trial.set_user_attr('score_min', score_min)
+        trial.set_user_attr('failed_prompts', failed_prompts)
+
+        for pid, text in prompt_texts.items():
+            trial.set_user_attr(f'response_text__{pid}', text)
+
+        # Averaged quality metrics across prompts
+        avg_metrics = _average_quality_metrics(prompt_metrics)
+        for key in _AVERAGED_METRIC_KEYS:
+            trial.set_user_attr(key, avg_metrics[key])
+        trial.set_user_attr('response_length', avg_metrics['response_length'])
+        trial.set_user_attr('slop_guard_band', avg_metrics['slop_guard_band'])
+        trial.set_user_attr('lazy_pattern_count', avg_metrics['lazy_pattern_count'])
         trial.set_user_attr('lazy_patterns_found',
-                            [[p, c] for p, c in patterns_found])
+                            [[p, c] for p, c in avg_metrics['lazy_patterns_found']])
 
-        if score < 0.1:
-            raise optuna.exceptions.TrialPruned(f"Low quality score: {score}")
+        # Per-prompt metric summary (compact)
+        per_prompt_summary = {}
+        for pid, m in prompt_metrics.items():
+            per_prompt_summary[pid] = {
+                'quality_score': m['quality_score'],
+                'repetition_penalty': m['repetition_penalty'],
+                'coherence_score': m['coherence_score'],
+                'readability_score': m['readability_score'],
+                'lazy_score': m.get('lazy_score', 0.0),
+                'prose_penalty': m.get('prose_penalty', 0.0),
+                'slop_guard_score': m.get('slop_guard_score', 50.0),
+            }
+        trial.set_user_attr('per_prompt_metrics', per_prompt_summary)
 
-        return score
+        if mean_score < 0.1:
+            raise optuna.exceptions.TrialPruned(f"Low mean quality score: {mean_score}")
+
+        return mean_score
 
     # ------------------------------------------------------------------
     # LLM generation
     # ------------------------------------------------------------------
-    def _generate_llm_response(self, params: Dict[str, Any]) -> str:
-        """Generate a completion from the LLM using the given sampling params."""
+    def _generate_for_prompt(self, prompt_entry: Dict[str, Any], params: Dict[str, Any]) -> str:
+        """Dispatch to the correct API based on prompt format."""
+        if prompt_entry["format"] == "chat":
+            return self._generate_chat_response(prompt_entry["messages"], params)
+        else:
+            return self._generate_completion_response(prompt_entry["text"], params)
+
+    def _generate_completion_response(self, prompt_text: str, params: Dict[str, Any]) -> str:
+        """Generate via client.completions.create (raw text continuation)."""
         native = {k: v for k, v in params.items() if k in NATIVE_OPENAI_PARAMS}
         extra = {k: v for k, v in params.items() if k not in NATIVE_OPENAI_PARAMS}
 
         kwargs: Dict[str, Any] = dict(
             model=self.model_name,
-            prompt=self.prompt,
+            prompt=prompt_text,
             max_tokens=self.max_tokens,
             **native,
         )
@@ -188,17 +463,39 @@ class OptunaParameterSweep:
         response = self.client.completions.create(**kwargs)
         return response.choices[0].text
 
+    def _generate_chat_response(self, messages: List[Dict[str, str]], params: Dict[str, Any]) -> str:
+        """Generate via client.chat.completions.create (chat format)."""
+        native = {k: v for k, v in params.items() if k in NATIVE_OPENAI_PARAMS}
+        extra = {k: v for k, v in params.items() if k not in NATIVE_OPENAI_PARAMS}
+
+        kwargs: Dict[str, Any] = dict(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            **native,
+        )
+        if extra:
+            kwargs['extra_body'] = extra
+
+        response = self.client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content
+
     # ------------------------------------------------------------------
     # Study runner
     # ------------------------------------------------------------------
     def run_study(self) -> optuna.Study:
         """Run the Optuna optimization study."""
+        pool = self.prompt_pool
         print(f"Starting Optuna parameter sweep")
         print(f"   API: {self.base_url}")
         print(f"   Model: {self.model_name}")
         print(f"   Max trials: {self.max_trials}")
         print(f"   Parallel jobs: {self.n_jobs}")
         print(f"   Study name: {self.study_name}")
+        mode_desc = pool.mode
+        if pool.mode == "sample":
+            mode_desc += f" (K={pool.samples_per_trial})"
+        print(f"   Prompt pool: {len(pool.prompts)} prompts, mode={mode_desc}")
         print()
 
         sampler = optuna.samplers.TPESampler(n_startup_trials=20)
@@ -227,13 +524,28 @@ class OptunaParameterSweep:
         """Print progress every 5 trials."""
         if trial.number % 5 == 0 or trial.number == 0:
             pruned = len(study.get_trials(deepcopy=False, states=[optuna.trial.TrialState.PRUNED]))
+            n_prompts = trial.user_attrs.get('num_prompts_evaluated', 1)
+            var_str = ""
+            if n_prompts > 1:
+                sv = trial.user_attrs.get('score_variance', 0)
+                var_str = f"  var={sv:.3f}"
             print(f"[{trial.number + 1}/{self.max_trials}]  "
                   f"best={study.best_value:.4f}  pruned={pruned}  "
+                  f"prompts={n_prompts}{var_str}  "
                   f"params={study.best_params}")
 
     # ------------------------------------------------------------------
     # Results
     # ------------------------------------------------------------------
+    def _get_response_texts(self, trial: optuna.Trial) -> Dict[str, str]:
+        """Collect per-prompt response texts from trial user attrs."""
+        texts = {}
+        for key, val in trial.user_attrs.items():
+            if key.startswith('response_text__'):
+                pid = key[len('response_text__'):]
+                texts[pid] = val
+        return texts
+
     def save_results(self, study: optuna.Study, filename: Optional[str] = None) -> str:
         """Save optimization results to JSON file."""
         if filename is None:
@@ -241,14 +553,23 @@ class OptunaParameterSweep:
 
         results = []
         for trial in study.trials:
+            response_texts = self._get_response_texts(trial)
+
             result = {
                 'trial_number': trial.number,
                 'state': trial.state.name,
                 'value': trial.value,
                 'parameters': trial.params,
-                'user_attrs': {k: v for k, v in trial.user_attrs.items()
-                               if k != 'response_text'},
-                'response_text': trial.user_attrs.get('response_text', ''),
+                'user_attrs': {
+                    k: v for k, v in trial.user_attrs.items()
+                    if not k.startswith('response_text')
+                },
+                'response_texts': response_texts,
+                'prompt_scores': trial.user_attrs.get('prompt_scores', {}),
+                'score_variance': trial.user_attrs.get('score_variance', 0.0),
+                'score_min': trial.user_attrs.get('score_min', 0.0),
+                'per_prompt_metrics': trial.user_attrs.get('per_prompt_metrics', {}),
+                'prompt_ids': trial.user_attrs.get('prompt_ids', []),
                 'datetime_start': trial.datetime_start.isoformat() if trial.datetime_start else None,
                 'datetime_complete': trial.datetime_complete.isoformat() if trial.datetime_complete else None,
             }
@@ -265,6 +586,9 @@ class OptunaParameterSweep:
         data = []
         for trial in study.trials:
             if trial.state == optuna.trial.TrialState.COMPLETE:
+                response_texts = self._get_response_texts(trial)
+                first_text = next(iter(response_texts.values()), '')
+
                 row = {
                     'trial': trial.number,
                     'value': trial.value,
@@ -282,7 +606,11 @@ class OptunaParameterSweep:
                     'slop_guard_score': trial.user_attrs.get('slop_guard_score', 50.0),
                     'slop_guard_band': trial.user_attrs.get('slop_guard_band', 'unknown'),
                     'slop_guard_violations': trial.user_attrs.get('slop_guard_violations', 0),
-                    'response_text': trial.user_attrs.get('response_text', ''),
+                    'score_variance': trial.user_attrs.get('score_variance', 0.0),
+                    'score_min': trial.user_attrs.get('score_min', 0.0),
+                    'num_prompts_evaluated': trial.user_attrs.get('num_prompts_evaluated', 1),
+                    'prompt_mode': trial.user_attrs.get('prompt_mode', 'single'),
+                    'response_text': first_text,
                 }
                 data.append(row)
 
@@ -324,6 +652,10 @@ class OptunaParameterSweep:
             'avg_readability_score': df['readability_score'].mean(),
             'avg_lazy_score': df['lazy_score'].mean(),
             'best_parameters': best_params,
+            'prompt_mode': df['prompt_mode'].iloc[0] if len(df) > 0 else 'unknown',
+            'avg_prompts_per_trial': df['num_prompts_evaluated'].mean(),
+            'avg_score_variance': df['score_variance'].mean(),
+            'avg_score_min': df['score_min'].mean(),
         }
 
     def print_summary(self, summary: Dict[str, Any]) -> None:
@@ -335,6 +667,13 @@ class OptunaParameterSweep:
 
         print("GENERAL:")
         print(f"   Total completed trials: {summary['completed_trials']}")
+        print()
+
+        print("PROMPT POOL:")
+        print(f"   Mode: {summary.get('prompt_mode', 'single')}")
+        print(f"   Avg prompts per trial:  {summary.get('avg_prompts_per_trial', 1):.1f}")
+        print(f"   Avg cross-prompt var:   {summary.get('avg_score_variance', 0):.4f}")
+        print(f"   Avg worst-prompt score: {summary.get('avg_score_min', 0):.4f}")
         print()
 
         print("QUALITY METRICS:")
@@ -400,12 +739,7 @@ class OptunaParameterSweep:
     def generate_top_results_report(self, study: optuna.Study, df: pd.DataFrame,
                                      top_n: int = 10,
                                      filename: Optional[str] = None) -> str:
-        """Generate a human-readable markdown report of the top N trials.
-
-        The report includes a sweep summary header, then each trial's sampler
-        parameters, quality metrics, and the full generated text -- designed to
-        be skimmed quickly by a human reviewer or fed to a judge model.
-        """
+        """Generate a human-readable markdown report of the top N trials."""
         if filename is None:
             filename = f"sweep_top_results_{self.run_suffix}.md"
 
@@ -428,6 +762,11 @@ class OptunaParameterSweep:
         lines.append("")
         lines.append(f"**Model:** {self.model_name}  ")
         lines.append(f"**Total trials:** {len(df)}  ")
+        pool = self.prompt_pool
+        mode_desc = pool.mode
+        if pool.mode == "sample":
+            mode_desc += f" (K={pool.samples_per_trial})"
+        lines.append(f"**Prompt pool:** {len(pool.prompts)} prompts, mode={mode_desc}  ")
         lines.append(f"**Score range:** {df['overall_score'].min():.3f} -- {df['overall_score'].max():.3f} "
                       f"(mean {df['overall_score'].mean():.3f})  ")
         lines.append(f"**Parameters swept:** {', '.join(param_cols)}")
@@ -443,6 +782,11 @@ class OptunaParameterSweep:
             sep += "---:|"
         header += " lazy | prose_pen | rep_pen |"
         sep += "---:|---:|---:|"
+        # Add variance columns when multi-prompt
+        is_multi = any(row.get('num_prompts_evaluated', 1) > 1 for _, row in top.iterrows())
+        if is_multi:
+            header += " var | min |"
+            sep += "---:|---:|"
         lines.append(header)
         lines.append(sep)
 
@@ -452,6 +796,8 @@ class OptunaParameterSweep:
                 val = row.get(col, 0)
                 line += f" {val:.2f} |" if isinstance(val, float) else f" {val} |"
             line += f" {row['lazy_score']:.2f} | {row['prose_penalty']:.2f} | {row['repetition_penalty']:.2f} |"
+            if is_multi:
+                line += f" {row.get('score_variance', 0):.3f} | {row.get('score_min', 0):.3f} |"
             lines.append(line)
 
         lines.append("")
@@ -487,29 +833,73 @@ class OptunaParameterSweep:
                 lines.append(f"| {col} | {val:.3f} |")
             lines.append("")
 
+            # Find the trial object for per-prompt data
+            trial_obj = None
+            for trial in study.trials:
+                if trial.number == trial_num:
+                    trial_obj = trial
+                    break
+
+            if trial_obj is None:
+                continue
+
+            # Per-prompt breakdown (if multi-prompt)
+            per_prompt = trial_obj.user_attrs.get('per_prompt_metrics', {})
+            if len(per_prompt) > 1:
+                lines.append("### Per-Prompt Scores")
+                lines.append("")
+                lines.append("| Prompt | Score | Lazy | Prose Pen | Rep Pen | Slop |")
+                lines.append("|---|---:|---:|---:|---:|---:|")
+                for pid, pm in sorted(per_prompt.items(),
+                                      key=lambda x: x[1].get('quality_score', 0),
+                                      reverse=True):
+                    lines.append(
+                        f"| {pid} | {pm.get('quality_score', 0):.3f} "
+                        f"| {pm.get('lazy_score', 0):.2f} | {pm.get('prose_penalty', 0):.2f} "
+                        f"| {pm.get('repetition_penalty', 0):.2f} | {pm.get('slop_guard_score', 50):.0f} |"
+                    )
+                lines.append("")
+                sv = trial_obj.user_attrs.get('score_variance', 0)
+                sm = trial_obj.user_attrs.get('score_min', 0)
+                lines.append(f"**Cross-prompt variance:** {sv:.4f}  "
+                             f"**Worst single:** {sm:.3f}")
+                lines.append("")
+
             # Slop patterns if any
             lazy_count = int(row.get('lazy_pattern_count', 0))
             if lazy_count > 0:
-                # Look up the patterns from the study's trial attrs
-                for trial in study.trials:
-                    if trial.number == trial_num:
-                        pats = trial.user_attrs.get('lazy_patterns_found', [])
-                        if pats:
-                            lines.append(f"**Slop patterns found ({lazy_count} total hits):** "
-                                         + ", ".join(f"{p} ({c}x)" for p, c in pats[:10]))
-                            lines.append("")
-                        break
+                pats = trial_obj.user_attrs.get('lazy_patterns_found', [])
+                if pats:
+                    lines.append(f"**Slop patterns found ({lazy_count} total hits):** "
+                                 + ", ".join(f"{p} ({c}x)" for p, c in pats[:10]))
+                    lines.append("")
 
-            # Generated text
-            lines.append("### Generated Text")
-            lines.append("")
-            text = row.get('response_text', '')
-            if text:
+            # Generated text(s)
+            response_texts = self._get_response_texts(trial_obj)
+
+            if len(response_texts) > 1:
+                lines.append("### Generated Texts")
+                lines.append("")
+                for pid, text in response_texts.items():
+                    score = per_prompt.get(pid, {}).get('quality_score', 0)
+                    lines.append(f"**{pid}** (score: {score:.3f}):")
+                    lines.append("")
+                    lines.append("```")
+                    lines.append(text.strip()[:2000])
+                    lines.append("```")
+                    lines.append("")
+            elif response_texts:
+                lines.append("### Generated Text")
+                lines.append("")
+                text = next(iter(response_texts.values()))
                 lines.append("```")
                 lines.append(text.strip())
                 lines.append("```")
             else:
+                lines.append("### Generated Text")
+                lines.append("")
                 lines.append("*(text not available)*")
+
             lines.append("")
             lines.append("---")
             lines.append("")
@@ -520,14 +910,6 @@ class OptunaParameterSweep:
 
         print(f"Top {len(top)} results report saved to: {filename}")
         return filename
-
-
-DEFAULT_PROMPT = """Continue the following story in vivid, creative prose:
-
-The morning Dagna found the dead radio tower, she was already three days late getting back to town.
-She sat on a lichen-covered boulder and ate the last of her dried fish while studying the structure.
-The cables had been cut -- not frayed, not corroded, but sliced clean through with something sharp.
-"""
 
 
 def main():
@@ -548,8 +930,9 @@ def main():
     study_name = "llm_parameter_optimization"
     top_n = 10
     label = ""
-    prompt = DEFAULT_PROMPT
     params_dict = dict(DEFAULT_PARAMETERS)
+
+    cfg = {}
 
     # --- Load config file if provided ------------------------------------
     if args.config:
@@ -567,15 +950,23 @@ def main():
         top_n = sweep_cfg.get('top_n', top_n)
         label = sweep_cfg.get('label', label)
 
-        if 'prompt' in cfg:
-            prompt = cfg['prompt']
-
         if 'parameters' in cfg:
             params_dict = cfg['parameters']
 
         print(f"Loaded config from: {args.config}")
 
     parameter_space = parse_parameter_space(params_dict)
+
+    # --- Build prompt pool -----------------------------------------------
+    prompt_pool = build_prompt_pool(cfg)
+
+    print(f"Prompt pool: {len(prompt_pool.prompts)} prompts, mode={prompt_pool.mode}"
+          + (f", K={prompt_pool.samples_per_trial}" if prompt_pool.mode == "sample" else ""))
+    for pid, entry in prompt_pool.prompts.items():
+        fmt = entry['format']
+        cat = entry.get('category', '?')
+        print(f"   [{fmt:10s}] {pid} ({cat})")
+    print()
 
     # --- Auto-detect model name if empty ---------------------------------
     if not model_name:
@@ -596,7 +987,7 @@ def main():
     sweep = OptunaParameterSweep(
         base_url=base_url,
         model_name=model_name,
-        prompt=prompt,
+        prompt_pool=prompt_pool,
         parameter_space=parameter_space,
         max_tokens=max_tokens,
         max_trials=max_trials,

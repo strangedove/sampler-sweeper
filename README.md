@@ -28,9 +28,9 @@ LLM_BASE_URL="http://localhost:5001/v1" SWEEP_MAX_TRIALS=50 \
 ## How It Works
 
 1. **Optuna** runs a [TPE sampler](https://optuna.readthedocs.io/en/stable/reference/samplers/generated/optuna.samplers.TPESampler.html) (20 random startup trials, then Bayesian optimization) to explore combinations of sampling parameters.
-2. Each trial sends a creative writing prompt to an OpenAI-compatible completions API with the suggested parameters.
-3. The generated text is scored by `analyze_results.py` across multiple quality dimensions.
-4. Optuna uses the scores to guide the search toward better parameter regions.
+2. Each trial selects prompts from a built-in pool (8 prompts across creative writing, roleplay, interactive fiction, and more) and sends them to an OpenAI-compatible API with the suggested parameters. Chat-format prompts use the chat completions endpoint; raw text prompts use the completions endpoint.
+3. Each generated text is scored by `analyze_results.py` across multiple quality dimensions. The trial's objective is the mean score across all prompts evaluated.
+4. Optuna uses the scores to guide the search toward better parameter regions. Cross-prompt variance is tracked to identify settings that are consistently good vs. occasionally lucky.
 
 At the end of a sweep you get:
 - **JSON** with all trial data (parameters, scores, full text)
@@ -62,10 +62,14 @@ parameters:
   top_p: [0.5, 1.0]
   rep_pen: [1.0, 1.3]
 
-# Optional: override the default prompt
-# prompt: |
-#   Continue the following story in vivid, creative prose:
-#   The old lighthouse keeper squinted at the horizon...
+# Prompt pool: which prompts to evaluate and how
+prompts:
+  mode: "sample"         # "sample" (K per trial), "all", or "random" (1 per trial)
+  samples_per_trial: 3   # only used in "sample" mode
+  # pool:                # list of built-in prompt IDs (omit to use all 8)
+  #   - "continuation_default"
+  #   - "instruct_writing_1"
+  #   - "character_roleplay_1"
 ```
 
 Parameter types are auto-detected: if both bounds are integers, the parameter is sampled as an integer; otherwise as a float. You can force a type with a third element: `[0, 100, "int"]`.
@@ -199,5 +203,5 @@ The scoring is a first-pass filter -- it catches obvious problems (repetition, s
 
 - Python >= 3.11
 - [uv](https://docs.astral.sh/uv/) for dependency management
-- An OpenAI-compatible completions API (tested with [KoboldCpp](https://github.com/LostRuins/koboldcpp))
+- An OpenAI-compatible API supporting both completions and chat completions endpoints (tested with [KoboldCpp](https://github.com/LostRuins/koboldcpp))
 - NLTK data (downloaded automatically on first run; falls back gracefully if unavailable)

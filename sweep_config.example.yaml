@@ -25,8 +25,48 @@ parameters:
   adaptive_target: [0.3, 0.7]
   adaptive_decay: [0.5, 0.9]
 
-# Optional: override the default prompt
-# prompt: |
-#   Continue the following story in vivid, creative prose:
+# Prompt pool configuration
+# If omitted entirely: uses all 8 built-in prompts in "sample" mode (K=3).
+# If the old `prompt:` key is present (without `prompts:`), it's treated as
+# a single-prompt pool in "all" mode (backward compatible).
 #
-#   The old lighthouse keeper squinted at the horizon...
+# Modes:
+#   "sample" - Each trial evaluates K randomly-selected prompts (default)
+#   "all"    - Every prompt evaluated every trial (expensive, cleanest signal)
+#   "random" - Single random prompt per trial (fastest, noisiest)
+#
+# Built-in prompt IDs:
+#   continuation_default   - Raw text story continuation (Dagna radio tower)
+#   instruct_writing_1     - Detective/greenhouse scene
+#   instruct_writing_2     - Lighthouse keeper radio transmission
+#   character_roleplay_1   - Marcus the merchant (fantasy RP)
+#   character_roleplay_2   - Sera the retired assassin (tavern RP)
+#   interactive_fiction_1  - Abandoned subway station
+#   interactive_fiction_2  - Post-apocalyptic pharmacy (multi-turn)
+#   general_assistant_6    - "Abvalid" creative word definition
+prompts:
+  mode: "sample"
+  samples_per_trial: 3
+  # pool: list of built-in prompt IDs to include (omit to use all 8)
+  # pool:
+  #   - "continuation_default"
+  #   - "instruct_writing_1"
+  #   - "instruct_writing_2"
+  #   - "character_roleplay_1"
+  #   - "character_roleplay_2"
+  #   - "interactive_fiction_1"
+  #   - "interactive_fiction_2"
+  #   - "general_assistant_6"
+
+  # Optional: add custom prompts alongside built-in ones
+  # custom:
+  #   - id: "my_chat_prompt"
+  #     category: "Custom RP"
+  #     messages:
+  #       - role: "system"
+  #         content: "You are a pirate captain."
+  #       - role: "user"
+  #         content: "Tell me about your ship."
+  #   - id: "my_continuation"
+  #     category: "Custom"
+  #     text: "The rain fell softly on the old wooden dock..."
