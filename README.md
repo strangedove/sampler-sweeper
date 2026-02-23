@@ -163,6 +163,8 @@ Calibration benchmarks:
 
 ### Scoring Benchmarks
 
+**Hey, a note. These are super old. I need to re-do them since there's been a lot of modifications to the scoring since then. Sorry!**
+
 Tested against human-written books and AI-generated text (n=30 each):
 
 | Source | Quality Score | Prose Penalty | Lazy Score |
