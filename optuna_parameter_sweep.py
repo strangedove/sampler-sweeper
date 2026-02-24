@@ -368,6 +368,11 @@ class OptunaParameterSweep:
         rng = random.Random(seed)
         selected = self.prompt_pool.select_for_trial(rng)
 
+        # During startup trials, use only 1 prompt for faster exploration
+        if trial.number < self.n_startup_trials and len(selected) > 1:
+            first_key = next(iter(selected))
+            selected = {first_key: selected[first_key]}
+
         trial.set_user_attr('prompt_ids', list(selected.keys()))
         trial.set_user_attr('prompt_mode', self.prompt_pool.mode)
         trial.set_user_attr('num_prompts_evaluated', len(selected))
@@ -558,26 +563,52 @@ class OptunaParameterSweep:
     # Convergence callback
     # ------------------------------------------------------------------
     class _ConvergenceCallback:
-        """Early-stop the study if the best score hasn't improved recently."""
+        """Early-stop the study if the best score hasn't improved recently.
+
+        Two counters run in parallel:
+        - completed_patience: counts only COMPLETE trials (precise signal)
+        - total_patience (2x completed): counts COMPLETE + PRUNED trials
+          (noisier but catches heavy-pruning scenarios where most new
+          suggestions can't beat the median)
+        Whichever counter fires first stops the study.
+        """
 
         def __init__(self, patience: int, min_delta: float):
             self.patience = patience
+            self.total_patience = patience * 2
             self.min_delta = min_delta
             self.best_value: Optional[float] = None
-            self.trials_since_improvement: int = 0
+            self.completed_since_improvement: int = 0
+            self.total_since_improvement: int = 0
 
         def __call__(self, study: optuna.Study, trial: optuna.Trial) -> None:
-            if trial.state != optuna.trial.TrialState.COMPLETE:
+            if trial.state not in (optuna.trial.TrialState.COMPLETE,
+                                   optuna.trial.TrialState.PRUNED):
                 return
-            current_best = study.best_value
-            if self.best_value is None or current_best > self.best_value + self.min_delta:
-                self.best_value = current_best
-                self.trials_since_improvement = 0
-            else:
-                self.trials_since_improvement += 1
-            if self.trials_since_improvement >= self.patience:
+
+            # Check for improvement (only on completed trials)
+            if trial.state == optuna.trial.TrialState.COMPLETE:
+                current_best = study.best_value
+                if (self.best_value is None
+                        or current_best > self.best_value + self.min_delta):
+                    self.best_value = current_best
+                    self.completed_since_improvement = 0
+                    self.total_since_improvement = 0
+                    return
+                self.completed_since_improvement += 1
+
+            # Both completed (non-improving) and pruned increment total
+            self.total_since_improvement += 1
+
+            if self.completed_since_improvement >= self.patience:
                 print(f"\n  [convergence] No improvement > {self.min_delta} in "
                       f"{self.patience} completed trials. "
+                      f"Best={self.best_value:.4f}. Stopping.")
+                study.stop()
+            elif self.total_since_improvement >= self.total_patience:
+                print(f"\n  [convergence] No improvement in "
+                      f"{self.total_since_improvement} total trials "
+                      f"(completed + pruned). "
                       f"Best={self.best_value:.4f}. Stopping.")
                 study.stop()
 
@@ -600,8 +631,11 @@ class OptunaParameterSweep:
         sampler_info = (f"TPE (multivariate, n_startup={self.n_startup_trials}"
                         + (", constant_liar" if self.n_jobs > 1 else "") + ")")
         print(f"   Sampler: {sampler_info}")
+        if pool.mode == "sample" and pool.samples_per_trial > 1:
+            print(f"   Startup trials: 1 prompt each (then K={pool.samples_per_trial})")
         if self.convergence_patience > 0:
-            print(f"   Convergence: patience={self.convergence_patience}, "
+            print(f"   Convergence: patience={self.convergence_patience} completed "
+                  f"/ {self.convergence_patience * 2} total, "
                   f"min_delta={self.convergence_min_delta}")
         if self.parallel_prompts:
             print(f"   Parallel prompts: enabled (per-prompt pruning disabled)")
