@@ -248,8 +248,20 @@ def calculate_coherence_metrics(text: str) -> Dict[str, float]:
     avg_sentence_length = np.mean(sentence_lengths)
     sentence_length_variation = np.std(sentence_lengths) / avg_sentence_length if avg_sentence_length > 0 else 0.0
     
-    # Simple coherence score (lower variation = more coherent)
-    coherence_score = 1.0 - min(sentence_length_variation, 1.0)
+    # Coherence score based on coefficient of variation of sentence lengths.
+    # Good prose has varied rhythm (CV ~0.3-0.8). Penalise only extremes:
+    # robot-like uniformity (CV < 0.15) or total chaos (CV > 1.2).
+    cv = sentence_length_variation  # already std/mean
+    if cv < 0.15:
+        coherence_score = 0.3        # very monotonous
+    elif cv < 0.3:
+        coherence_score = 0.3 + (cv - 0.15) / 0.15 * 0.5   # ramp up
+    elif cv <= 0.8:
+        coherence_score = 0.8        # sweet spot — varied but controlled
+    elif cv <= 1.2:
+        coherence_score = 0.8 - (cv - 0.8) / 0.4 * 0.4     # too chaotic
+    else:
+        coherence_score = 0.4        # extremely chaotic, floor
     
     return {
         'sentence_count': len(sentences),
@@ -293,8 +305,17 @@ def calculate_readability_metrics(text: str) -> Dict[str, float]:
     unique_words = len(set(words))
     lexical_diversity = unique_words / word_count
     
-    # Simple readability score (higher = more readable)
-    readability_score = lexical_diversity * (1.0 - min(avg_word_length / 10.0, 1.0))
+    # Readability score using Guiraud's R (root TTR) — length-independent
+    # lexical diversity.  R = unique / sqrt(total).
+    # Typical range: 7-14 for English prose.
+    guiraud_r = unique_words / np.sqrt(word_count) if word_count > 0 else 0.0
+    # Rescale: 7.0 → 0.0, 13.0 → 1.0
+    ld_rescaled = float(np.clip((guiraud_r - 7.0) / 6.0, 0.0, 1.0))
+    # Word length: only penalise very long averages (academic jargon).
+    # avg_word_length typical range: 4.0-5.5
+    wl_penalty = max(0.0, (avg_word_length - 5.5) / 3.0)
+    wl_penalty = min(wl_penalty, 0.3)
+    readability_score = ld_rescaled * (1.0 - wl_penalty)
     
     return {
         'word_count': word_count,
@@ -440,15 +461,17 @@ def calculate_prose_quality_metrics(text: str) -> Dict[str, float]:
     # ======================================================================
     # 2. Non-stopword frequency spike
     # ======================================================================
-    content_words = [w for w in words if w not in stop_words and len(w) > 2]
+    # Exclude short words and capitalised words (likely proper nouns/names)
+    content_words = [w for w in words if w not in stop_words and len(w) > 3
+                     and not w[0].isupper()]
     if content_words:
         cw_counts = Counter(content_words)
         # Density = occurrences per 100 words for the most-repeated content word
         worst_density = cw_counts.most_common(1)[0][1] / (word_count / 100.0)
-        # A content word appearing 1× per 100 words is normal.
-        # 3× per 100 words is noticeable.  5+ is bad.
-        # Sigmoid curve: 0 at density≤1, ~0.5 at density=3, ~0.8 at density=5
-        word_frequency_spike = 1.0 - 1.0 / (1.0 + max(0, worst_density - 1.0) / 2.0)
+        # Threshold: 2 per 100 words is normal for focused writing.
+        # 4+ is noticeable, 6+ is problematic.
+        word_frequency_spike = max(0.0, (worst_density - 2.0) / 4.0)
+        word_frequency_spike = min(word_frequency_spike, 1.0)
     else:
         word_frequency_spike = 0.0
 
@@ -533,7 +556,59 @@ def calculate_prose_quality_metrics(text: str) -> Dict[str, float]:
         paragraph_uniformity = max(staccato, uniformity)
 
     # ======================================================================
-    # 6. Dialogue / narration balance
+    # 6. Markdown emphasis in prose
+    # ======================================================================
+    # LLMs love wrapping words in *asterisks* for dramatic effect — a dead
+    # giveaway.  However, in character RP, *wrapping whole actions/narration
+    # in italics* is a legitimate style convention.
+    #
+    # Heuristic: short emphasis (1-3 words between asterisks) = AI tell.
+    # Longer spans (4+ words) = likely RP action narration, tolerated.
+    #
+    # We match single-asterisk italics (*...*) but NOT double (**...**).
+    md_emphasis_pattern = re.compile(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)')
+    md_matches = md_emphasis_pattern.findall(text)
+
+    short_emphasis_count = 0
+    for match in md_matches:
+        word_count_in_match = len(match.split())
+        if word_count_in_match <= 3:
+            short_emphasis_count += 1
+
+    # Score: 0 at 0 hits, ramps up.  2+ short emphasis instances in a
+    # passage is very noticeable; 5+ is heavy AI style.
+    if short_emphasis_count == 0:
+        markdown_emphasis_penalty = 0.0
+    elif short_emphasis_count <= 2:
+        markdown_emphasis_penalty = short_emphasis_count * 0.15
+    else:
+        # Saturates toward 1.0
+        markdown_emphasis_penalty = min(1.0, 0.3 + (short_emphasis_count - 2) * 0.14)
+
+    # ======================================================================
+    # 7. Em-dash density (escalating penalty)
+    # ======================================================================
+    # One em-dash is fine — even good writers use them.  But LLMs lean on
+    # them heavily, averaging one per paragraph or more.  Penalty escalates
+    # with density (em-dashes per paragraph).
+    em_dash_count = len(re.findall(r'\u2014| -- ', text))
+    # Use estimated paragraph count: actual paragraphs OR ~1 per 80 words,
+    # whichever is higher.  This prevents contiguous text excerpts (no
+    # double-newline breaks) from being treated as a single giant paragraph.
+    est_para = max(n_para, word_count // 80)
+    em_dash_per_para = em_dash_count / max(est_para, 1)
+    # Allow ~0.5 per paragraph (one every two paragraphs) as baseline.
+    # Beyond that, escalating quadratic curve.
+    if em_dash_per_para <= 0.5:
+        em_dash_density_penalty = 0.0
+    else:
+        excess = em_dash_per_para - 0.5
+        # Quadratic numerator for steep ramp: ~0.11 at 1/para, ~0.33 at
+        # 1.5/para, ~0.53 at 2/para, ~0.78 at 3/para
+        em_dash_density_penalty = 1.0 - 1.0 / (1.0 + excess * excess / 2.0)
+
+    # ======================================================================
+    # 8. Dialogue / narration balance
     # ======================================================================
     # Count lines that look like dialogue (contain quoted speech)
     dialogue_sents = 0
@@ -557,15 +632,17 @@ def calculate_prose_quality_metrics(text: str) -> Dict[str, float]:
     # ======================================================================
     # Composite prose penalty
     # ======================================================================
-    # Weighted average — sentence start monotony and telling density are the
-    # most noticeable flaws, followed by rhythm issues.
+    # Weighted average — markdown emphasis and sentence start monotony are
+    # strong AI tells, followed by em-dash abuse and word frequency spike.
     prose_penalty = (
-        sentence_start_monotony * 0.30 +
-        word_frequency_spike * 0.20 +
-        sentence_length_uniformity * 0.15 +
-        telling_verb_density * 0.15 +
+        sentence_start_monotony * 0.20 +
+        word_frequency_spike * 0.15 +
+        sentence_length_uniformity * 0.05 +
+        telling_verb_density * 0.10 +
         paragraph_uniformity * 0.10 +
-        dialogue_narration_balance * 0.10
+        dialogue_narration_balance * 0.05 +
+        markdown_emphasis_penalty * 0.20 +
+        em_dash_density_penalty * 0.15
     )
     # Clamp
     prose_penalty = np.clip(prose_penalty, 0.0, 1.0)
@@ -577,6 +654,8 @@ def calculate_prose_quality_metrics(text: str) -> Dict[str, float]:
         'telling_verb_density': float(telling_verb_density),
         'paragraph_uniformity': float(paragraph_uniformity),
         'dialogue_narration_balance': float(dialogue_narration_balance),
+        'markdown_emphasis_penalty': float(markdown_emphasis_penalty),
+        'em_dash_density_penalty': float(em_dash_density_penalty),
         'prose_penalty': float(prose_penalty),
     }
 
@@ -714,7 +793,11 @@ def detect_lazy_uncreative_text(
     # score   = 1 - 1/(1 + density)   (shifted hyperbola, 0→0, inf→1)
     word_count = max(1, len(text.split()))
     density = total_hits / (word_count / 100.0)  # hits per 100 words
-    lazy_score = 1.0 - 1.0 / (1.0 + density)
+    # Allow ~0.3 hits per 100 words as baseline noise (an occasional
+    # "murmured" or "couldn't help but" in published fiction is fine).
+    adjusted_density = max(0.0, density - 0.3)
+    # Gentler curve: 0 at ≤0.3 hit/100w, ramps up smoothly
+    lazy_score = 1.0 - 1.0 / (1.0 + adjusted_density / 2.0)
 
     return {
         'lazy_pattern_count': total_hits,
@@ -787,10 +870,10 @@ def analyze_text_quality(
     prose_pen = prose_metrics['prose_penalty']
 
     base_quality = (
-        coherence_metrics['coherence_score'] * 0.20 +
-        readability_metrics['readability_score'] * 0.20 +
-        (1.0 - lazy_penalty) * 0.30 +
-        slop_guard_normalized * 0.30
+        coherence_metrics['coherence_score'] * 0.25 +
+        readability_metrics['readability_score'] * 0.15 +
+        (1.0 - lazy_penalty) * 0.40 +
+        slop_guard_normalized * 0.20
     )
     # Multiplicative penalties: each one independently crushes the score
     # when severe, but mild values across multiple dimensions don't

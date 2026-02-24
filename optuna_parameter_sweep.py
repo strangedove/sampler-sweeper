@@ -310,7 +310,9 @@ class OptunaParameterSweep:
                  study_name: str = "llm_parameter_optimization",
                  storage: Optional[str] = None,
                  api_key: str = "not-needed",
-                 label: str = ""):
+                 label: str = "",
+                 checkpoint_interval: int = 0,
+                 top_n: int = 10):
         self.base_url = base_url
         self.model_name = model_name
         self.prompt_pool = prompt_pool
@@ -322,6 +324,8 @@ class OptunaParameterSweep:
         self.storage = storage
         self.label = label
         self.parameter_space = parameter_space or parse_parameter_space(DEFAULT_PARAMETERS)
+        self.checkpoint_interval = checkpoint_interval
+        self.top_n = top_n
 
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -439,12 +443,30 @@ class OptunaParameterSweep:
     # ------------------------------------------------------------------
     # LLM generation
     # ------------------------------------------------------------------
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Strip thinking blocks from reasoning-model output.
+
+        Handles multiple formats: <think>...</think> and [THINK]...[/THINK].
+        """
+        if not text:
+            return text
+        import re
+        # Strip closed think blocks — both <think> and [THINK] formats
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+        text = re.sub(r'\[THINK\].*?\[/THINK\]\s*', '', text, flags=re.DOTALL).strip()
+        # Strip unclosed think block (model ran out of tokens mid-thinking)
+        text = re.sub(r'<think>.*', '', text, flags=re.DOTALL).strip()
+        text = re.sub(r'\[THINK\].*', '', text, flags=re.DOTALL).strip()
+        return text
+
     def _generate_for_prompt(self, prompt_entry: Dict[str, Any], params: Dict[str, Any]) -> str:
         """Dispatch to the correct API based on prompt format."""
         if prompt_entry["format"] == "chat":
-            return self._generate_chat_response(prompt_entry["messages"], params)
+            raw = self._generate_chat_response(prompt_entry["messages"], params)
         else:
-            return self._generate_completion_response(prompt_entry["text"], params)
+            raw = self._generate_completion_response(prompt_entry["text"], params)
+        return self._strip_thinking(raw)
 
     def _generate_completion_response(self, prompt_text: str, params: Dict[str, Any]) -> str:
         """Generate via client.completions.create (raw text continuation)."""
@@ -521,7 +543,10 @@ class OptunaParameterSweep:
         return study
 
     def _progress_callback(self, study: optuna.Study, trial: optuna.Trial) -> None:
-        """Print progress every 5 trials."""
+        """Print progress every 5 trials and save checkpoints at configured intervals."""
+        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        n_completed = len(completed)
+
         if trial.number % 5 == 0 or trial.number == 0:
             pruned = len(study.get_trials(deepcopy=False, states=[optuna.trial.TrialState.PRUNED]))
             n_prompts = trial.user_attrs.get('num_prompts_evaluated', 1)
@@ -529,10 +554,33 @@ class OptunaParameterSweep:
             if n_prompts > 1:
                 sv = trial.user_attrs.get('score_variance', 0)
                 var_str = f"  var={sv:.3f}"
+            best_str = f"best={study.best_value:.4f}" if n_completed > 0 else "best=N/A"
             print(f"[{trial.number + 1}/{self.max_trials}]  "
-                  f"best={study.best_value:.4f}  pruned={pruned}  "
+                  f"{best_str}  pruned={pruned}  "
                   f"prompts={n_prompts}{var_str}  "
-                  f"params={study.best_params}")
+                  f"params={study.best_params if n_completed > 0 else '{}'}")
+
+        # Save checkpoint at configured intervals
+        if (self.checkpoint_interval > 0
+                and n_completed > 0
+                and (trial.number + 1) % self.checkpoint_interval == 0):
+            self._save_checkpoint(study, trial.number + 1)
+
+    def _save_checkpoint(self, study: optuna.Study, trial_num: int) -> None:
+        """Save intermediate results as a checkpoint."""
+        suffix = self.run_suffix
+        cp_json = f"checkpoint_{suffix}_t{trial_num}.json"
+        cp_report = f"checkpoint_{suffix}_t{trial_num}.md"
+
+        try:
+            self.save_results(study, filename=cp_json)
+            df = self.analyze_results(study)
+            if len(df) > 0:
+                self.generate_top_results_report(study, df, top_n=self.top_n,
+                                                 filename=cp_report)
+            print(f"  [checkpoint] Saved at trial {trial_num}: {cp_json}, {cp_report}")
+        except Exception as e:
+            print(f"  [checkpoint] Warning: failed to save checkpoint at trial {trial_num}: {e}")
 
     # ------------------------------------------------------------------
     # Results
@@ -930,6 +978,7 @@ def main():
     study_name = "llm_parameter_optimization"
     top_n = 10
     label = ""
+    checkpoint_interval = 0
     params_dict = dict(DEFAULT_PARAMETERS)
 
     cfg = {}
@@ -949,6 +998,7 @@ def main():
         study_name = sweep_cfg.get('study_name', study_name)
         top_n = sweep_cfg.get('top_n', top_n)
         label = sweep_cfg.get('label', label)
+        checkpoint_interval = sweep_cfg.get('checkpoint_interval', checkpoint_interval)
 
         if 'parameters' in cfg:
             params_dict = cfg['parameters']
@@ -995,6 +1045,8 @@ def main():
         study_name=study_name,
         api_key=api_key,
         label=label,
+        checkpoint_interval=checkpoint_interval,
+        top_n=top_n,
     )
 
     study = sweep.run_study()

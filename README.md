@@ -105,33 +105,34 @@ sweep_top_results_apertus-8b-run1.md
 The quality score is a composite designed to reward coherent, lexically diverse prose while penalizing repetition, cliches, and flat writing. It's computed as:
 
 ```
-base  = coherence * 0.20 + readability * 0.20 + (1 - lazy_score) * 0.30 + slop_guard * 0.30
+base  = coherence * 0.25 + readability * 0.15 + (1 - lazy_score) * 0.40 + slop_guard * 0.20
 score = base * (1 - repetition_penalty) * (1 - prose_penalty)
 ```
 
-The lazy score catches phrase-level cliches via pattern matching, while `slop_guard` detects structural and rhetorical AI tells (see below). The multiplicative penalties mean that severe repetition or flat prose crushes the score regardless of other metrics.
+The lazy score (largest weight) catches phrase-level cliches via pattern matching and is the single best differentiator between human and AI text. `slop_guard` detects structural and rhetorical AI tells (see below). The multiplicative penalties mean that severe repetition or flat prose crushes the score regardless of other metrics.
 
 ### Component Metrics
 
 #### Coherence (0-1)
 
-Measures sentence-level structural consistency. Based on the coefficient of variation of sentence lengths -- text with wildly erratic sentence sizes scores lower.
+Rewards varied sentence rhythm. Based on the coefficient of variation (CV) of sentence lengths, with a sweet spot at CV 0.3-0.8 (natural prose rhythm). Robot-like uniformity (CV < 0.15) and total chaos (CV > 1.2) are both penalized.
 
 #### Readability (0-1)
 
-Combines lexical diversity (unique words / total words) with a penalty for excessively long words. Rewards varied vocabulary without purple prose.
+Uses Guiraud's R (unique words / sqrt(total words)), a length-independent lexical diversity measure, with a mild penalty for very long average word lengths (academic jargon). This avoids the bias where shorter LLM outputs get artificially high type-token ratios.
 
 #### Lazy Score (0-1) -- "Slop Detection"
 
 Detects AI writing cliches and overused phrases. Patterns are loaded from `slop_patterns.yaml` (editable):
 
-- **~240 literal phrases** matched case-insensitively: "couldn't help but smile", "a wave of warmth", "steeled herself", "newfound determination", "palpable tension", etc.
-- **8 regex patterns** for structural problems: repeated words in consecutive sentences, ellipsis spam, purple prose noun-chains ("eyes of steel"), dialogue tag abuse ("exclaimed/proclaimed/declared"), adverb-verb cliches ("slowly reached"), etc.
+- **~250 literal phrases** matched case-insensitively: "couldn't help but smile", "a wave of warmth", "steeled herself", "newfound determination", "palpable tension", etc.
+- **10 regex patterns** for structural problems: repeated words in consecutive sentences, ellipsis spam, purple prose noun-chains ("eyes of steel"), dialogue tag abuse ("exclaimed/proclaimed/declared"), adverb-verb cliches ("slowly reached"), repeated negation pairs ("Not X. Not Y."), etc.
 - Includes slop vocabulary from the [Heretic](https://huggingface.co/collections/DavidAU/heretic-series-672f06d26ad3bbee52e8a8b8) config: Elara, Lumina, Eldoria, tapestry, sentinel, kaleidoscopic, etc.
+- Common AI-generated character names (Elara, Mara, Voss, Vance) and overused words (conspiratorial).
 
 To customize the patterns, edit `slop_patterns.yaml` directly. The file has two sections: `literal_strings` (case-insensitive substring matches) and `regex_patterns` (compiled with `re.IGNORECASE`).
 
-Scoring uses a hyperbolic curve: `1 - 1/(1 + density)` where density = pattern hits per 100 words. Light slop barely registers; heavy slop saturates toward 1.0.
+Scoring uses a shifted hyperbolic curve with a noise floor: density below 0.3 hits per 100 words is treated as baseline (even published fiction occasionally uses one of these phrases). Above that, `1 - 1/(1 + adjusted_density / 2)` ramps up smoothly.
 
 #### Slop Guard (0-100)
 
@@ -149,35 +150,37 @@ Final penalty is the max of the n-gram composite and the block-level score.
 
 #### Prose Penalty (0-1)
 
-Six sub-metrics measuring prose craft, weighted into a composite:
+Eight sub-metrics measuring prose craft, weighted into a composite:
 
 | Sub-metric | Weight | What it catches |
 |---|---|---|
-| Sentence start monotony | 30% | Low Shannon entropy of first words (e.g. 20% of sentences start with "She") |
-| Word frequency spike | 20% | Non-stopword used excessively (e.g. "seemed" appearing 8 times in 500 words) |
-| Sentence length uniformity | 15% | Coefficient of variation too low = robotic same-length sentences |
-| Telling verb density | 15% | Overuse of seemed/felt/realized/knew/noticed/wondered/etc. vs. showing |
+| Sentence start monotony | 20% | Low Shannon entropy of first words (e.g. 20% of sentences start with "She") |
+| Markdown emphasis | 20% | Inline `*emphasis*` words in prose (AI tell); long `*RP action blocks*` are tolerated |
+| Word frequency spike | 15% | Non-stopword used excessively; excludes proper nouns and short words |
+| Em-dash density | 15% | Escalating penalty for em-dash overuse (per-paragraph, with paragraph estimation for excerpts) |
+| Telling verb density | 10% | Overuse of seemed/felt/realized/knew/noticed/wondered/etc. vs. showing |
 | Paragraph uniformity | 10% | All-staccato (1-2 sentence paragraphs) or wall-of-text |
-| Dialogue/narration balance | 10% | U-shaped: no dialogue or all dialogue both penalized; 10-65% is ideal |
+| Sentence length uniformity | 5% | Coefficient of variation too low = robotic same-length sentences |
+| Dialogue/narration balance | 5% | U-shaped: no dialogue or all dialogue both penalized; 10-65% is ideal |
 
 Calibration benchmarks:
-- Well-written human prose: ~0.11 penalty
-- Typical LLM creative output: ~0.23-0.28 penalty
-- Pathological "She seemed/felt" text: ~0.71 penalty
+- Published fiction: ~0.08 penalty
+- Non-fiction: ~0.07 penalty
+- Typical LLM creative output: ~0.10-0.15 penalty
+- Sloppy LLM (heavy emphasis, em-dashes, staccato): ~0.20-0.35 penalty
 
 ### Scoring Benchmarks
 
-**Hey, a note. These are super old. I need to re-do them since there's been a lot of modifications to the scoring since then. Sorry!**
+Calibrated against published fiction (40 samples from [marvin_no_anthologies](https://huggingface.co/datasets)), non-fiction (40 samples from [the-anarchist-library](https://huggingface.co/datasets/allura-org/the-anarchist-library)), and LLM outputs (8 prompts at optimized sampler settings):
 
-Tested against human-written books and AI-generated text (n=30 each):
+| Source | Quality Score | Prose Penalty | Lazy Score | Slop Guard |
+|---|---|---|---|---|
+| Published fiction (n=40) | 0.737 +/- 0.043 | 0.079 | 0.037 | 87 |
+| Non-fiction (n=40) | 0.711 +/- 0.048 | 0.074 | 0.011 | 69 |
+| LLM optimized (n=8) | 0.539 +/- 0.105 | 0.105 | 0.230 | 46 |
+| LLM sloppy (n=8) | ~0.47 | ~0.15 | ~0.30 | ~50 |
 
-| Source | Quality Score | Prose Penalty | Lazy Score |
-|---|---|---|---|
-| Human novels | 0.393 +/- 0.081 | 0.108 | 0.189 |
-| AI roleplay (123B) | 0.352 +/- 0.048 | 0.138 | 0.397 |
-| Sweep trials (8B) | 0.343 +/- 0.060 | 0.248 | 0.370 |
-
-The biggest differentiator between human and AI text is the lazy score (slop), not prose structure.
+The biggest differentiator between human and AI text is the lazy score (slop pattern density), followed by readability (Guiraud's R lexical diversity).
 
 ## Files
 
@@ -186,7 +189,7 @@ The biggest differentiator between human and AI text is the lazy score (slop), n
 | `optuna_parameter_sweep.py` | Main sweep script |
 | `analyze_results.py` | Text quality analysis module |
 | `slop_guard.py` | Structural AI-tell detection from [slop-guard](https://github.com/eric-tramel/slop-guard) |
-| `slop_patterns.yaml` | Editable list of lazy/slop patterns (~240 phrases + 9 regexes) |
+| `slop_patterns.yaml` | Editable list of lazy/slop patterns (~250 phrases + 10 regexes) |
 | `sweep_config.example.yaml` | Example YAML config |
 | `analyze_chat_results.py` | Standalone analyzer for chat-format results (not actively maintained) |
 

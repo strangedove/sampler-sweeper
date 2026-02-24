@@ -270,6 +270,11 @@ literal_strings:
   - "neon lights"
   - "a thousand ships"
   - "Elara"
+  - "Mara"
+  - "Voss"
+  - "Vance"
+  - "conspiratorial"
+  - "the choice is yours"
 
 regex_patterns:
   # Repeated word (same word 3+ times in a row): "very very very"
@@ -296,3 +301,7 @@ regex_patterns:
 
   # "tasted like X and Y" -- AI-characteristic concrete+abstract sensory pairing
   - '\btasted\s+(?:like|of)\s+\w+\s+and\s+'
+
+  # Repeated negation pairs: "Not X. Not Y." / "Not X, not Y." / "No X, no Y"
+  # Catches clustered sentence/clause-initial negations, not mid-sentence "not"
+  - '(?:Not|No)\s+\w+[^.!?\n]{0,60}[.!?,;:\u2014\u2014]\s*(?:not|Not|No|no)\s+\w+'
