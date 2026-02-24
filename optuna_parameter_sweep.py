@@ -19,6 +19,7 @@ Dependencies:
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import hashlib
 import optuna
@@ -312,7 +313,11 @@ class OptunaParameterSweep:
                  api_key: str = "not-needed",
                  label: str = "",
                  checkpoint_interval: int = 0,
-                 top_n: int = 10):
+                 top_n: int = 10,
+                 convergence_patience: int = 25,
+                 convergence_min_delta: float = 0.005,
+                 parallel_prompts: bool = False,
+                 n_startup_trials: int = 12):
         self.base_url = base_url
         self.model_name = model_name
         self.prompt_pool = prompt_pool
@@ -326,6 +331,10 @@ class OptunaParameterSweep:
         self.parameter_space = parameter_space or parse_parameter_space(DEFAULT_PARAMETERS)
         self.checkpoint_interval = checkpoint_interval
         self.top_n = top_n
+        self.convergence_patience = convergence_patience
+        self.convergence_min_delta = convergence_min_delta
+        self.parallel_prompts = parallel_prompts
+        self.n_startup_trials = n_startup_trials
 
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -369,26 +378,69 @@ class OptunaParameterSweep:
         prompt_metrics: Dict[str, Dict[str, Any]] = {}
         failed_prompts = 0
 
-        for pid, entry in selected.items():
-            try:
-                response_text = self._generate_for_prompt(entry, params)
-            except Exception as e:
-                print(f"  [trial {trial.number}] API error on '{pid}': {e}")
-                failed_prompts += 1
-                continue
+        if self.parallel_prompts:
+            # -- Parallel path: evaluate all prompts concurrently --
+            def _eval_prompt(pid_entry):
+                pid, entry = pid_entry
+                try:
+                    response_text = self._generate_for_prompt(entry, params)
+                except Exception as e:
+                    return pid, None, None, str(e)
+                if not response_text or len(response_text.strip()) < 20:
+                    return pid, None, None, "empty"
+                quality = analyze_text_quality(response_text)
+                return pid, response_text, quality, None
 
-            if not response_text or len(response_text.strip()) < 20:
-                failed_prompts += 1
-                continue
+            with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+                futures = {executor.submit(_eval_prompt, item): item
+                           for item in selected.items()}
+                for future in as_completed(futures):
+                    pid, response_text, quality, error = future.result()
+                    if error:
+                        if error != "empty":
+                            print(f"  [trial {trial.number}] API error on '{pid}': {error}")
+                        failed_prompts += 1
+                        continue
+                    score = quality['quality_score']
+                    prompt_scores[pid] = score
+                    prompt_texts[pid] = response_text
+                    quality['_response_text'] = response_text
+                    prompt_metrics[pid] = quality
+        else:
+            # -- Sequential path: per-prompt pruning --
+            step = 0
+            for pid, entry in selected.items():
+                try:
+                    response_text = self._generate_for_prompt(entry, params)
+                except Exception as e:
+                    print(f"  [trial {trial.number}] API error on '{pid}': {e}")
+                    failed_prompts += 1
+                    continue
 
-            quality = analyze_text_quality(response_text)
-            score = quality['quality_score']
+                if not response_text or len(response_text.strip()) < 20:
+                    failed_prompts += 1
+                    continue
 
-            prompt_scores[pid] = score
-            prompt_texts[pid] = response_text
-            # Stash the raw text in the metrics dict for _average_quality_metrics
-            quality['_response_text'] = response_text
-            prompt_metrics[pid] = quality
+                quality = analyze_text_quality(response_text)
+                score = quality['quality_score']
+
+                prompt_scores[pid] = score
+                prompt_texts[pid] = response_text
+                quality['_response_text'] = response_text
+                prompt_metrics[pid] = quality
+
+                # Report running mean to pruner
+                running_mean = float(np.mean(list(prompt_scores.values())))
+                trial.report(running_mean, step)
+                step += 1
+
+                if trial.should_prune():
+                    trial.set_user_attr('prompt_scores', prompt_scores)
+                    trial.set_user_attr('pruned_at_step', step)
+                    raise optuna.exceptions.TrialPruned(
+                        f"Pruned at step {step}/{len(selected)}, "
+                        f"running_mean={running_mean:.3f}"
+                    )
 
         if not prompt_scores:
             raise optuna.exceptions.TrialPruned(
@@ -503,6 +555,33 @@ class OptunaParameterSweep:
         return response.choices[0].message.content
 
     # ------------------------------------------------------------------
+    # Convergence callback
+    # ------------------------------------------------------------------
+    class _ConvergenceCallback:
+        """Early-stop the study if the best score hasn't improved recently."""
+
+        def __init__(self, patience: int, min_delta: float):
+            self.patience = patience
+            self.min_delta = min_delta
+            self.best_value: Optional[float] = None
+            self.trials_since_improvement: int = 0
+
+        def __call__(self, study: optuna.Study, trial: optuna.Trial) -> None:
+            if trial.state != optuna.trial.TrialState.COMPLETE:
+                return
+            current_best = study.best_value
+            if self.best_value is None or current_best > self.best_value + self.min_delta:
+                self.best_value = current_best
+                self.trials_since_improvement = 0
+            else:
+                self.trials_since_improvement += 1
+            if self.trials_since_improvement >= self.patience:
+                print(f"\n  [convergence] No improvement > {self.min_delta} in "
+                      f"{self.patience} completed trials. "
+                      f"Best={self.best_value:.4f}. Stopping.")
+                study.stop()
+
+    # ------------------------------------------------------------------
     # Study runner
     # ------------------------------------------------------------------
     def run_study(self) -> optuna.Study:
@@ -518,10 +597,24 @@ class OptunaParameterSweep:
         if pool.mode == "sample":
             mode_desc += f" (K={pool.samples_per_trial})"
         print(f"   Prompt pool: {len(pool.prompts)} prompts, mode={mode_desc}")
+        sampler_info = (f"TPE (multivariate, n_startup={self.n_startup_trials}"
+                        + (", constant_liar" if self.n_jobs > 1 else "") + ")")
+        print(f"   Sampler: {sampler_info}")
+        if self.convergence_patience > 0:
+            print(f"   Convergence: patience={self.convergence_patience}, "
+                  f"min_delta={self.convergence_min_delta}")
+        if self.parallel_prompts:
+            print(f"   Parallel prompts: enabled (per-prompt pruning disabled)")
         print()
 
-        sampler = optuna.samplers.TPESampler(n_startup_trials=20)
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
+        sampler_kwargs = {
+            'n_startup_trials': self.n_startup_trials,
+            'multivariate': True,
+        }
+        if self.n_jobs > 1:
+            sampler_kwargs['constant_liar'] = True
+        sampler = optuna.samplers.TPESampler(**sampler_kwargs)
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=1)
 
         study = optuna.create_study(
             study_name=self.study_name,
@@ -532,12 +625,19 @@ class OptunaParameterSweep:
             load_if_exists=True,
         )
 
+        callbacks = [self._progress_callback]
+        if self.convergence_patience > 0:
+            callbacks.append(
+                self._ConvergenceCallback(self.convergence_patience,
+                                          self.convergence_min_delta)
+            )
+
         study.optimize(
             self.objective,
             n_trials=self.max_trials,
             timeout=self.timeout,
             n_jobs=self.n_jobs,
-            callbacks=[self._progress_callback],
+            callbacks=callbacks,
         )
 
         return study
@@ -979,6 +1079,10 @@ def main():
     top_n = 10
     label = ""
     checkpoint_interval = 0
+    convergence_patience = 25
+    convergence_min_delta = 0.005
+    parallel_prompts = False
+    n_startup_trials = 12
     params_dict = dict(DEFAULT_PARAMETERS)
 
     cfg = {}
@@ -999,6 +1103,10 @@ def main():
         top_n = sweep_cfg.get('top_n', top_n)
         label = sweep_cfg.get('label', label)
         checkpoint_interval = sweep_cfg.get('checkpoint_interval', checkpoint_interval)
+        convergence_patience = sweep_cfg.get('convergence_patience', convergence_patience)
+        convergence_min_delta = sweep_cfg.get('convergence_min_delta', convergence_min_delta)
+        parallel_prompts = sweep_cfg.get('parallel_prompts', parallel_prompts)
+        n_startup_trials = sweep_cfg.get('n_startup_trials', n_startup_trials)
 
         if 'parameters' in cfg:
             params_dict = cfg['parameters']
@@ -1047,6 +1155,10 @@ def main():
         label=label,
         checkpoint_interval=checkpoint_interval,
         top_n=top_n,
+        convergence_patience=convergence_patience,
+        convergence_min_delta=convergence_min_delta,
+        parallel_prompts=parallel_prompts,
+        n_startup_trials=n_startup_trials,
     )
 
     study = sweep.run_study()

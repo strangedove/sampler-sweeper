@@ -27,7 +27,7 @@ LLM_BASE_URL="http://localhost:5001/v1" SWEEP_MAX_TRIALS=50 \
 
 ## How It Works
 
-1. **Optuna** runs a [TPE sampler](https://optuna.readthedocs.io/en/stable/reference/samplers/generated/optuna.samplers.TPESampler.html) (20 random startup trials, then Bayesian optimization) to explore combinations of sampling parameters.
+1. **Optuna** runs a [TPE sampler](https://optuna.readthedocs.io/en/stable/reference/samplers/generated/optuna.samplers.TPESampler.html) (configurable random startup trials, then multivariate Bayesian optimization) to explore combinations of sampling parameters.
 2. Each trial selects prompts from a built-in pool (8 prompts across creative writing, roleplay, interactive fiction, and more) and sends them to an OpenAI-compatible API with the suggested parameters. Chat-format prompts use the chat completions endpoint; raw text prompts use the completions endpoint.
 3. Each generated text is scored by `analyze_results.py` across multiple quality dimensions. The trial's objective is the mean score across all prompts evaluated.
 4. Optuna uses the scores to guide the search toward better parameter regions. Cross-prompt variance is tracked to identify settings that are consistently good vs. occasionally lucky.
@@ -54,6 +54,12 @@ sweep:
   study_name: "llm_parameter_optimization"
   top_n: 10              # how many top trials in the .md report
   label: "my-model-v2"   # optional: used as output filename suffix
+  checkpoint_interval: 10
+  # Speed optimizations
+  convergence_patience: 25      # stop if no improvement in N trials (0=disabled)
+  convergence_min_delta: 0.005  # minimum improvement to reset patience
+  parallel_prompts: false       # evaluate prompts concurrently (for vLLM)
+  n_startup_trials: 12          # random exploration before Bayesian optimization
 
 parameters:
   temperature: [0.1, 2.0]
@@ -89,6 +95,15 @@ Config file values override env vars, which override defaults.
 ### Parameter Routing
 
 Parameters the OpenAI client accepts natively (`temperature`, `top_p`, `max_tokens`, `frequency_penalty`, `presence_penalty`) are passed as keyword arguments. Everything else (`min_p`, `top_k`, `rep_pen`, `typical`, `adaptive_target`, `adaptive_decay`, etc.) is sent via `extra_body`, which KoboldCpp and other backends accept.
+
+### Speed Optimizations
+
+Several features reduce wasted API calls during a sweep:
+
+- **Per-prompt pruning**: In sequential mode (default), after each prompt is scored, the running mean is reported to Optuna's MedianPruner. If the first 1-2 prompts score well below the median of previous trials, remaining prompts are skipped.
+- **Convergence early stopping**: A callback tracks the best score across completed trials. If no improvement exceeding `convergence_min_delta` is seen in `convergence_patience` trials, the study stops early via `study.stop()`.
+- **Multivariate TPE**: The sampler models correlations between parameters (e.g. temperature and min_p tend to interact), producing better suggestions faster.
+- **Parallel prompt evaluation** (`parallel_prompts: true`): Fires all prompts for a trial concurrently via ThreadPoolExecutor. Useful with backends that handle concurrent requests (vLLM, TGI). Disables per-prompt pruning since all prompts run at once. Not recommended for single-user backends like KoboldCpp.
 
 ### Output Filenames
 
