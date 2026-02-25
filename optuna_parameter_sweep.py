@@ -317,7 +317,9 @@ class OptunaParameterSweep:
                  convergence_patience: int = 25,
                  convergence_min_delta: float = 0.005,
                  parallel_prompts: bool = False,
-                 n_startup_trials: int = 12):
+                 n_startup_trials: int = 12,
+                 api_extra_body: Optional[Dict[str, Any]] = None,
+                 assistant_prefill: str = ""):
         self.base_url = base_url
         self.model_name = model_name
         self.prompt_pool = prompt_pool
@@ -335,6 +337,8 @@ class OptunaParameterSweep:
         self.convergence_min_delta = convergence_min_delta
         self.parallel_prompts = parallel_prompts
         self.n_startup_trials = n_startup_trials
+        self.api_extra_body = api_extra_body or {}
+        self.assistant_prefill = assistant_prefill
 
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -529,10 +533,15 @@ class OptunaParameterSweep:
         """Generate via client.completions.create (raw text continuation)."""
         native = {k: v for k, v in params.items() if k in NATIVE_OPENAI_PARAMS}
         extra = {k: v for k, v in params.items() if k not in NATIVE_OPENAI_PARAMS}
+        extra = {**self.api_extra_body, **extra}  # config defaults, overridden by sweep params
+
+        prompt = prompt_text
+        if self.assistant_prefill:
+            prompt = prompt_text + self.assistant_prefill
 
         kwargs: Dict[str, Any] = dict(
             model=self.model_name,
-            prompt=prompt_text,
+            prompt=prompt,
             max_tokens=self.max_tokens,
             **native,
         )
@@ -546,6 +555,7 @@ class OptunaParameterSweep:
         """Generate via client.chat.completions.create (chat format)."""
         native = {k: v for k, v in params.items() if k in NATIVE_OPENAI_PARAMS}
         extra = {k: v for k, v in params.items() if k not in NATIVE_OPENAI_PARAMS}
+        extra = {**self.api_extra_body, **extra}  # config defaults, overridden by sweep params
 
         kwargs: Dict[str, Any] = dict(
             model=self.model_name,
@@ -1117,6 +1127,8 @@ def main():
     convergence_min_delta = 0.005
     parallel_prompts = False
     n_startup_trials = 12
+    api_extra_body = {}
+    assistant_prefill = ""
     params_dict = dict(DEFAULT_PARAMETERS)
 
     cfg = {}
@@ -1129,6 +1141,8 @@ def main():
         model_name = api_cfg.get('model', model_name)
         api_key = api_cfg.get('api_key', api_key)
         max_tokens = api_cfg.get('max_tokens', max_tokens)
+        api_extra_body = api_cfg.get('extra_body', {})
+        assistant_prefill = api_cfg.get('assistant_prefill', assistant_prefill)
 
         sweep_cfg = cfg.get('sweep', {})
         max_trials = sweep_cfg.get('max_trials', max_trials)
@@ -1193,6 +1207,8 @@ def main():
         convergence_min_delta=convergence_min_delta,
         parallel_prompts=parallel_prompts,
         n_startup_trials=n_startup_trials,
+        api_extra_body=api_extra_body,
+        assistant_prefill=assistant_prefill,
     )
 
     study = sweep.run_study()
