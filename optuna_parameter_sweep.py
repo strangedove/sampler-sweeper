@@ -816,8 +816,8 @@ class OptunaParameterSweep:
     def _save_checkpoint(self, study: optuna.Study, trial_num: int) -> None:
         """Save intermediate results as a checkpoint."""
         suffix = self.run_suffix
-        cp_json = f"checkpoint_{suffix}_t{trial_num}.json"
-        cp_report = f"checkpoint_{suffix}_t{trial_num}.md"
+        cp_json = f"checkpoint_{suffix}.json"
+        cp_report = f"checkpoint_{suffix}.md"
 
         try:
             self.save_results(study, filename=cp_json)
