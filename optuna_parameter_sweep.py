@@ -623,6 +623,58 @@ class OptunaParameterSweep:
                 study.stop()
 
     # ------------------------------------------------------------------
+    # Startup re-validation
+    # ------------------------------------------------------------------
+    def _revalidate_startup_trials(self, study: optuna.Study) -> int:
+        """Re-evaluate top startup trials with full prompt budget.
+
+        During the startup phase, trials use only 1 prompt for speed.
+        The top performers may have gotten lucky with a single sample.
+        This method enqueues them for re-evaluation with the configured
+        samples_per_trial so the Bayesian optimizer has accurate data.
+
+        Returns the number of re-evaluation trials enqueued.
+        """
+        K = self.prompt_pool.samples_per_trial
+        if K <= 1:
+            return 0
+
+        # Find completed startup trials that used fewer prompts
+        startup_completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+            and t.number < self.n_startup_trials
+            and t.user_attrs.get('num_prompts_evaluated', 1) < K
+        ]
+
+        if not startup_completed:
+            return 0
+
+        # Re-evaluate top 3 by score
+        n_reeval = min(3, len(startup_completed))
+        top_startup = sorted(startup_completed,
+                             key=lambda t: t.value, reverse=True)[:n_reeval]
+
+        print(f"\n  [revalidation] Re-evaluating top {n_reeval} startup trials "
+              f"with {K} prompts (were 1):")
+        for t in top_startup:
+            print(f"    Trial #{t.number}: score={t.value:.4f} "
+                  f"-> queued for {K}-prompt evaluation")
+        print()
+
+        for t in top_startup:
+            study.enqueue_trial(
+                t.params,
+                user_attrs={
+                    'is_revalidation': True,
+                    'original_trial': t.number,
+                    'original_score': t.value,
+                },
+            )
+
+        return n_reeval
+
+    # ------------------------------------------------------------------
     # Study runner
     # ------------------------------------------------------------------
     def run_study(self) -> optuna.Study:
@@ -642,7 +694,8 @@ class OptunaParameterSweep:
                         + (", constant_liar" if self.n_jobs > 1 else "") + ")")
         print(f"   Sampler: {sampler_info}")
         if pool.mode == "sample" and pool.samples_per_trial > 1:
-            print(f"   Startup trials: 1 prompt each (then K={pool.samples_per_trial})")
+            print(f"   Startup trials: 1 prompt each, top 3 re-validated "
+                  f"with K={pool.samples_per_trial}")
         if self.convergence_patience > 0:
             print(f"   Convergence: patience={self.convergence_patience} completed "
                   f"/ {self.convergence_patience * 2} total, "
@@ -676,13 +729,52 @@ class OptunaParameterSweep:
                                           self.convergence_min_delta)
             )
 
-        study.optimize(
-            self.objective,
-            n_trials=self.max_trials,
-            timeout=self.timeout,
-            n_jobs=self.n_jobs,
-            callbacks=callbacks,
+        # Determine if we need the two-phase startup + re-validation flow.
+        # This applies when: multi-prompt mode, startup trials use 1 prompt,
+        # and the study hasn't already passed the startup phase (e.g. resume).
+        existing_trials = len(study.trials)
+        needs_revalidation = (
+            pool.samples_per_trial > 1
+            and self.n_startup_trials > 0
+            and existing_trials < self.n_startup_trials
         )
+
+        self._display_total = self.max_trials  # used by _progress_callback
+
+        if needs_revalidation:
+            # Phase 1: Startup random trials (1 prompt each for speed)
+            startup_remaining = self.n_startup_trials - existing_trials
+            study.optimize(
+                self.objective,
+                n_trials=startup_remaining,
+                timeout=self.timeout,
+                n_jobs=self.n_jobs,
+                callbacks=callbacks,
+            )
+
+            # Re-validate top startup trials with full prompt budget
+            n_reeval = self._revalidate_startup_trials(study)
+            self._display_total = self.max_trials + n_reeval
+
+            # Phase 2: Bayesian optimization + re-evaluations
+            remaining = self.max_trials - self.n_startup_trials + n_reeval
+            if remaining > 0:
+                study.optimize(
+                    self.objective,
+                    n_trials=remaining,
+                    timeout=self.timeout,
+                    n_jobs=self.n_jobs,
+                    callbacks=callbacks,
+                )
+        else:
+            # Normal single-phase run (single-prompt mode or resuming)
+            study.optimize(
+                self.objective,
+                n_trials=self.max_trials,
+                timeout=self.timeout,
+                n_jobs=self.n_jobs,
+                callbacks=callbacks,
+            )
 
         return study
 
@@ -690,8 +782,9 @@ class OptunaParameterSweep:
         """Print progress every 5 trials and save checkpoints at configured intervals."""
         completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         n_completed = len(completed)
+        is_reeval = trial.user_attrs.get('is_revalidation', False)
 
-        if trial.number % 5 == 0 or trial.number == 0:
+        if trial.number % 5 == 0 or trial.number == 0 or is_reeval:
             pruned = len(study.get_trials(deepcopy=False, states=[optuna.trial.TrialState.PRUNED]))
             n_prompts = trial.user_attrs.get('num_prompts_evaluated', 1)
             var_str = ""
@@ -699,9 +792,19 @@ class OptunaParameterSweep:
                 sv = trial.user_attrs.get('score_variance', 0)
                 var_str = f"  var={sv:.3f}"
             best_str = f"best={study.best_value:.4f}" if n_completed > 0 else "best=N/A"
-            print(f"[{trial.number + 1}/{self.max_trials}]  "
+            display_total = getattr(self, '_display_total', self.max_trials)
+            reeval_str = ""
+            if is_reeval:
+                orig = trial.user_attrs.get('original_trial', '?')
+                orig_score = trial.user_attrs.get('original_score', 0)
+                new_score = (f"{trial.value:.3f}"
+                             if trial.state == optuna.trial.TrialState.COMPLETE
+                             else "pruned")
+                reeval_str = (f"  REVALIDATION of #{orig}: "
+                              f"{orig_score:.3f}->{new_score}")
+            print(f"[{trial.number + 1}/{display_total}]  "
                   f"{best_str}  pruned={pruned}  "
-                  f"prompts={n_prompts}{var_str}  "
+                  f"prompts={n_prompts}{var_str}{reeval_str}  "
                   f"params={study.best_params if n_completed > 0 else '{}'}")
 
         # Save checkpoint at configured intervals
